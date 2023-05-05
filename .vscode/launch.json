@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "preLaunchTask": "cargo build debug",
+            "name": "(lldb) Debug Client",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/noude.exe",
+            "cwd": "${workspaceFolder}",
+            "args": [ "run" ],
+            "sourceLanguages": [ "rust" ]
+        }
+    ]
+}
