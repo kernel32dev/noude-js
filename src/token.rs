@@ -94,14 +94,14 @@ fn parse_token<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -> Optio
         b' ' | b'\t' | b'\n' | b'\r' => {
             panic!("parse_next foi chamado e code começava com espaço em branco")
         }
-        0..=31 | b'#' | b'@' | b'\x7f' => {
+        0..=31 | b'#' | b'@' | b'`' | b'\x7f' => {
             errors.push(CompError::new(
                 "caractere inválido".into(),
                 Some(parse_slice(code, 1)),
             ));
             parse_token(code, errors)
         }
-        b'"' | b'\'' | b'`' => Some(parse_token_string(code, errors)),
+        b'"' | b'\'' => Some(parse_token_string(code, errors)),
         b'0'..=b'9' => Some(parse_token_number(code, errors)),
         b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'$' | 128.. => Some(parse_token_word(code)),
         b'.' => {
@@ -482,7 +482,7 @@ mod tests {
         assert_valid(Literal(String), "\"\\01a\"");
         assert_valid(Literal(String), "\"\\012a\"");
         assert_valid(Literal(String), "'\\xFF'");
-        assert_valid(Literal(String), "`\\uABCD`");
+        assert_valid(Literal(String), "'\\uABCD'");
 
         assert_invalid(Literal(Number), "1_");
         assert_invalid(Literal(Number), "1_.1");
