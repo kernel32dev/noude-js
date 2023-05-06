@@ -1,8 +1,16 @@
+
+use crate::utils::CompError;
+
 /// um iterador construido a partir de um `&str` que retorna `Token`
+///
+/// note que o iterador funciona com referências, ele recebe uma referência para o código e retorna referências para o código, nada nunca é alocado
+///
+/// exceto erros que são sim alocados em um Vec
 #[derive(Clone)]
 pub struct TokenIter<'a> {
     remaining: &'a str,
     current: Option<Token<'a>>,
+    errors: Vec<CompError<'a>>,
 }
 
 /// uma palavra, numero, ou string do código
@@ -49,10 +57,12 @@ pub enum Space {
 impl<'a> TokenIter<'a> {
     pub fn new(mut code: &'a str) -> Self {
         parse_space(&mut code);
-        let current = parse_token(&mut code);
+        let mut errors = Vec::new();
+        let current = parse_token(&mut code, &mut errors);
         Self {
             remaining: code,
             current,
+            errors,
         }
     }
     pub fn peek(&self) -> Option<&Token<'a>> {
@@ -65,7 +75,7 @@ impl<'a> Iterator for TokenIter<'a> {
     /// retorna o token atualmente selecionado, e seleciona o próximo
     fn next(&mut self) -> Option<Self::Item> {
         let previous = self.current.take();
-        self.current = parse_token(&mut self.remaining);
+        self.current = parse_token(&mut self.remaining, &mut self.errors);
         previous
     }
 }
@@ -75,7 +85,7 @@ impl<'a> Iterator for TokenIter<'a> {
 /// e o token obtido é retornado
 ///
 /// se code for vazio, retorna None
-fn parse_token<'a>(code: &mut &'a str) -> Option<Token<'a>> {
+fn parse_token<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -> Option<Token<'a>> {
     if code.is_empty() {
         return None;
     }
@@ -84,31 +94,39 @@ fn parse_token<'a>(code: &mut &'a str) -> Option<Token<'a>> {
         b' ' | b'\t' | b'\n' | b'\r' => {
             panic!("parse_next foi chamado e code começava com espaço em branco")
         }
-        0..=31 | b'#' | b'\x7f' => todo!("Retornar erro: caractere inválido"),
-        b'"' | b'\'' | b'`' => Some(parse_token_string(code)),
-        b'0'..=b'9' => Some(parse_token_number(code)),
+        0..=31 | b'#' | b'@' | b'\x7f' => {
+            errors.push(CompError::new(
+                "caractere inválido".into(),
+                Some(parse_slice(code, 1)),
+            ));
+            parse_token(code, errors)
+        }
+        b'"' | b'\'' | b'`' => Some(parse_token_string(code, errors)),
+        b'0'..=b'9' => Some(parse_token_number(code, errors)),
         b'A'..=b'Z' | b'a'..=b'z' | b'_' | b'$' | 128.. => Some(parse_token_word(code)),
         b'.' => {
             if bytes.len() >= 2 && matches!(bytes[1], b'0'..=b'9') {
-                Some(parse_token_number(code))
+                Some(parse_token_number(code, errors))
             } else {
                 Some(parse_token_punct(code))
             }
         }
         b'!' | b'%' | b'&' | b'(' | b')' | b'*' | b'+' | b',' | b'-' | b'/' | b':' | b';'
-        | b'<' | b'=' | b'>' | b'?' | b'@' | b'[' | b'\\' | b']' | b'^' | b'{' | b'|' | b'}'
-        | b'~' => Some(parse_token_punct(code)),
+        | b'<' | b'=' | b'>' | b'?' | b'[' | b'\\' | b']' | b'^' | b'{' | b'|' | b'}' | b'~' => {
+            Some(parse_token_punct(code))
+        }
     }
 }
 
-fn parse_token_number<'a>(code: &mut &'a str) -> Token<'a> {
+fn parse_token_number<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -> Token<'a> {
     /// returna true se text contem apneas digitos ascii ou _, e não começa nem termina com _
     fn validate(text: &str) -> bool {
-        if !text.starts_with('_') && !text.ends_with('_') {
-            for byte in text.as_bytes() {
-                if !matches!(*byte, b'0'..=b'9' | b'_') {
-                    return false;
-                }
+        if text.starts_with('_') || text.ends_with('_') {
+            return false;
+        }
+        for byte in text.as_bytes() {
+            if !matches!(*byte, b'0'..=b'9' | b'_') {
+                return false;
             }
         }
         true
@@ -117,36 +135,68 @@ fn parse_token_number<'a>(code: &mut &'a str) -> Token<'a> {
         code,
         find(code, |x| !(x == b'.' || x == b'-' || is_word_byte(x))),
     );
-    let number = if let Some((number, exponent)) = text.split_once(|x| matches!(x, 'e' | 'E')) {
-        let exponent_valid = if exponent.starts_with('-') {
-            validate(&exponent[1..])
-        } else {
-            validate(exponent)
-        };
-        if !exponent_valid {
-            todo!("Retornar erro: literal numérico inválido");
-        }
-        number
-    } else {
-        text
-    };
-    let number_valid = if let Some((integer, fraction)) = number.split_once('.') {
-        validate(integer) && validate(fraction)
-    } else {
-        validate(number)
-    };
-    if !number_valid {
-        todo!("Retornar erro: literal numérico inválido");
-    }
-    let space = parse_space(code);
-    Token {
+    let token = Token {
         text,
-        space,
+        space: parse_space(code),
         ty: TokenType::Literal(TokenLiteralType::Number),
+    };
+    if text == "0" {
+        return token;
     }
+    if text.starts_with('0') {
+        let bytes = &text.as_bytes()[2..];
+        let mut iter = bytes.iter();
+        let valid = !bytes.is_empty()
+            && bytes.first() != Some(&b'_')
+            && bytes.last() != Some(&b'_')
+            && match text.as_bytes()[1] {
+                b'0'..=b'9' => iter.all(|x| matches!(x, b'0'..=b'9')),
+                b'b' => iter.all(|x| matches!(x, b'0' | b'1')),
+                b'o' => iter.all(|x| matches!(x, b'0'..=b'7')),
+                b'x' => iter.all(|x| matches!(x, b'0'..=b'9' | b'A'..=b'F' | b'a'..=b'f')),
+                _ => false,
+            };
+        if !valid {
+            errors.push(CompError::new(
+                "literal numérico inválido".into(),
+                Some(text),
+            ));
+        }
+    } else {
+        let number = if let Some((number, exponent)) = text.split_once(|x| matches!(x, 'e' | 'E')) {
+            let exponent_valid = if exponent.starts_with('-') {
+                validate(&exponent[1..])
+            } else {
+                validate(exponent)
+            };
+            if !exponent_valid {
+                errors.push(CompError::new(
+                    "literal numérico inválido".into(),
+                    Some(text),
+                ));
+                return token;
+            }
+            number
+        } else {
+            text
+        };
+        let number_valid = if let Some((integer, fraction)) = number.split_once('.') {
+            validate(integer) && validate(fraction)
+        } else {
+            validate(number)
+        };
+        if !number_valid {
+            errors.push(CompError::new(
+                "literal numérico inválido".into(),
+                Some(text),
+            ));
+            return token;
+        }
+    }
+    return token;
 }
 
-fn parse_token_string<'a>(code: &mut &'a str) -> Token<'a> {
+fn parse_token_string<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -> Token<'a> {
     let delimiter = code.as_bytes()[0];
     let bytes = code.as_bytes();
     let mut iter = 1..bytes.len();
@@ -176,7 +226,10 @@ fn parse_token_string<'a>(code: &mut &'a str) -> Token<'a> {
                                 break 'outer;
                             };
                             if !matches!(bytes[index], b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F') {
-                                todo!("Retornar erro: esperado caractere hexadecimal")
+                                errors.push(CompError::new(
+                                    "esperado caractere hexadecimal".into(),
+                                    Some(&code[index..index + 1]),
+                                ))
                             }
                         }
                     }
@@ -187,12 +240,18 @@ fn parse_token_string<'a>(code: &mut &'a str) -> Token<'a> {
                                 break 'outer;
                             };
                             if !matches!(bytes[index], b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F') {
-                                todo!("Retornar erro: esperado caractere hexadecimal")
+                                errors.push(CompError::new(
+                                    "esperado caractere hexadecimal".into(),
+                                    Some(&code[index..index + 1]),
+                                ))
                             }
                         }
                     }
-                    0..=31 | 127 => todo!("Retornar erro: caractere invalido"),
-                    _ => {} // todos os outros caracteres, ou não são escapes inválidos,
+                    0..=31 | 127 => errors.push(CompError::new(
+                        "caractere invalido".into(),
+                        Some(&code[index..index + 1]),
+                    )),
+                    _ => {} // os outros caracteres, ou são escapes inválidos,
                             // ou são válidos e ocupam apenas um caractere e não requerem validação
                 }
             }
@@ -205,11 +264,25 @@ fn parse_token_string<'a>(code: &mut &'a str) -> Token<'a> {
                     };
                 }
             }
-            b'\r' | b'\n' => todo!("Retornar erro: string não terminada"),
-            0..=31 | 127 => todo!("Retornar erro: caractere invalido"),
+            b'\r' | b'\n' => errors.push(CompError::new(
+                "string não terminada".into(),
+                Some(&code[index - 1..index]),
+            )),
+            0..=31 | 127 => errors.push(CompError::new(
+                "caractere invalido".into(),
+                Some(&code[index..index + 1]),
+            )),
         }
     }
-    todo!("Retornar erro: string não terminada")
+    errors.push(CompError::new(
+        "string não terminada".into(),
+        Some(&code[code.len() - 1..]),
+    ));
+    Token {
+        text: parse_slice(code, code.len()),
+        space: parse_space(code),
+        ty: TokenType::Literal(TokenLiteralType::String),
+    }
 }
 
 fn parse_token_word<'a>(code: &mut &'a str) -> Token<'a> {
@@ -342,72 +415,108 @@ fn is_word_byte(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::Space::*;
     use super::TokenLiteralType::*;
     use super::TokenType::*;
+    use super::*;
+    impl<'a> TokenIter<'a> {
+        fn test_next(&mut self, text: &str, space: super::Space, ty: TokenType) {
+            assert_eq!(self.next(), Some(Token { text, space, ty }));
+        }
+    }
     #[test]
     fn teste_geral_ok() {
-        let mut iter = TokenIter::new("function add(a, b) {\nreturn a + b;\n}\nconsole.log(add(1, 2));");
-        assert_eq!(iter.next(), Some(Token {text: "function", space: Space, ty: Keyword }));
-        assert_eq!(iter.next(), Some(Token {text: "add", space: Joint, ty: Identifier }));
-        assert_eq!(iter.next(), Some(Token {text: "(", space: Joint, ty: Punct }));
-        assert_eq!(iter.next(), Some(Token {text: "a", space: Joint, ty: Identifier }));
-        assert_eq!(iter.next(), Some(Token {text: ",", space: Space, ty: Punct }));
-        assert_eq!(iter.next(), Some(Token {text: "b", space: Joint, ty: Identifier }));
-        assert_eq!(iter.next(), Some(Token {text: ")", space: Space, ty: Punct }));
-        assert_eq!(iter.next(), Some(Token {text: "{", space: Line, ty: Punct }));
-        assert_eq!(iter.next(), Some(Token {text: "return", space: Space, ty: Keyword }));
-        assert_eq!(iter.next(), Some(Token {text: "a", space: Space, ty: Identifier }));
-        assert_eq!(iter.next(), Some(Token {text: "+", space: Space, ty: Punct }));
-        assert_eq!(iter.next(), Some(Token {text: "b", space: Joint, ty: Identifier }));
-        assert_eq!(iter.next(), Some(Token {text: ";", space: Line, ty: Punct }));
-        assert_eq!(iter.next(), Some(Token {text: "}", space: Line, ty: Punct }));
-        assert_eq!(iter.next(), Some(Token {text: "console", space: Joint, ty: Identifier }));
-        assert_eq!(iter.next(), Some(Token {text: ".", space: Joint, ty: Punct }));
-        assert_eq!(iter.next(), Some(Token {text: "log", space: Joint, ty: Identifier }));
-        assert_eq!(iter.next(), Some(Token {text: "(", space: Joint, ty: Punct }));
-        assert_eq!(iter.next(), Some(Token {text: "add", space: Joint, ty: Identifier }));
-        assert_eq!(iter.next(), Some(Token {text: "(", space: Joint, ty: Punct }));
-        assert_eq!(iter.next(), Some(Token {text: "1", space: Joint, ty: Literal(Number) }));
-        assert_eq!(iter.next(), Some(Token {text: ",", space: Space, ty: Punct }));
-        assert_eq!(iter.next(), Some(Token {text: "2", space: Joint, ty: Literal(Number) }));
-        assert_eq!(iter.next(), Some(Token {text: ")", space: Joint, ty: Punct }));
-        assert_eq!(iter.next(), Some(Token {text: ")", space: Joint, ty: Punct }));
-        assert_eq!(iter.next(),
-            Some(Token {
-                text: ";",
-                space: Space,
-                ty: Punct
-            })
-        );
+        let mut iter =
+            TokenIter::new("function add(a, b) {\nreturn a + b;\n}\nconsole.log(add(1, 2));");
+        iter.test_next("function", Space, Keyword);
+        iter.test_next("add", Joint, Identifier);
+        iter.test_next("(", Joint, Punct);
+        iter.test_next("a", Joint, Identifier);
+        iter.test_next(",", Space, Punct);
+        iter.test_next("b", Joint, Identifier);
+        iter.test_next(")", Space, Punct);
+        iter.test_next("{", Line, Punct);
+        iter.test_next("return", Space, Keyword);
+        iter.test_next("a", Space, Identifier);
+        iter.test_next("+", Space, Punct);
+        iter.test_next("b", Joint, Identifier);
+        iter.test_next(";", Line, Punct);
+        iter.test_next("}", Line, Punct);
+        iter.test_next("console", Joint, Identifier);
+        iter.test_next(".", Joint, Punct);
+        iter.test_next("log", Joint, Identifier);
+        iter.test_next("(", Joint, Punct);
+        iter.test_next("add", Joint, Identifier);
+        iter.test_next("(", Joint, Punct);
+        iter.test_next("1", Joint, Literal(Number));
+        iter.test_next(",", Space, Punct);
+        iter.test_next("2", Joint, Literal(Number));
+        iter.test_next(")", Joint, Punct);
+        iter.test_next(")", Joint, Punct);
+        iter.test_next(";", Space, Punct);
         assert_eq!(iter.next(), None);
     }
     #[test]
     fn teste_literais_ok() {
-        assert_valid_type(Literal(Number), "1");
-        assert_valid_type(Literal(Number), "1.1");
-        assert_valid_type(Literal(Number), "1.");
-        assert_valid_type(Literal(Number), ".1");
-        assert_valid_type(Literal(Number), "1_1");
-        assert_valid_type(Literal(Number), "1_1.1_1");
-        assert_valid_type(Literal(Number), "1_1.");
-        assert_valid_type(Literal(Number), ".1_1");
-        assert_valid_type(Literal(Number), "1e1");
-        assert_valid_type(Literal(Number), "1.1e-1");
-        assert_valid_type(Literal(Number), "1.E1");
-        assert_valid_type(Literal(Number), ".1E-1");
-        assert_valid_type(Literal(Number), "1_1e1");
-        assert_valid_type(Literal(Number), "1_1.1_1e-1");
-        assert_valid_type(Literal(Number), "1_1.E1");
-        assert_valid_type(Literal(Number), ".1_1E-1");
-        assert_valid_type(Literal(String), "\"\\0a\"");
-        assert_valid_type(Literal(String), "\"\\01a\"");
-        assert_valid_type(Literal(String), "\"\\012a\"");
-        assert_valid_type(Literal(String), "'\\xFF'");
-        assert_valid_type(Literal(String), "`\\uABCD`");
+        assert_valid(Literal(Number), "1");
+        assert_valid(Literal(Number), "1.1");
+        assert_valid(Literal(Number), "1.");
+        assert_valid(Literal(Number), ".1");
+        assert_valid(Literal(Number), "1_1");
+        assert_valid(Literal(Number), "1_1.1_1");
+        assert_valid(Literal(Number), "1_1.");
+        assert_valid(Literal(Number), ".1_1");
+        assert_valid(Literal(Number), "1e1");
+        assert_valid(Literal(Number), "1.1e-1");
+        assert_valid(Literal(Number), "1.E1");
+        assert_valid(Literal(Number), ".1E-1");
+        assert_valid(Literal(Number), "1_1e1");
+        assert_valid(Literal(Number), "1_1.1_1e-1");
+        assert_valid(Literal(Number), "1_1.E1");
+        assert_valid(Literal(Number), ".1_1E-1");
+        assert_valid(Literal(Number), "0b011010");
+        assert_valid(Literal(Number), "0o013716");
+        assert_valid(Literal(Number), "0x23FAcD");
+
+        assert_valid(Literal(String), "\"\\0a\"");
+        assert_valid(Literal(String), "\"\\01a\"");
+        assert_valid(Literal(String), "\"\\012a\"");
+        assert_valid(Literal(String), "'\\xFF'");
+        assert_valid(Literal(String), "`\\uABCD`");
+
+        assert_invalid(Literal(Number), "1_");
+        assert_invalid(Literal(Number), "1_.1");
+        assert_invalid(Literal(Number), "1_.");
+        assert_invalid(Literal(Number), ".1_");
+        assert_invalid(Literal(Number), "1_e1");
+        assert_invalid(Literal(Number), "1.1e_-1");
+        assert_invalid(Literal(Number), "1.E1_");
+        assert_invalid(Literal(Number), ".1_E-1");
+        assert_invalid(Literal(Number), "1_1e_1");
+        assert_invalid(Literal(Number), "1_1.1_1e-1_");
+        assert_invalid(Literal(Number), "1_1.E1_");
+        assert_invalid(Literal(Number), ".1_1_E-1");
+        assert_invalid(Literal(Number), "0b");
+        assert_invalid(Literal(Number), "0o");
+        assert_invalid(Literal(Number), "0x");
+        assert_invalid(Literal(Number), "0b2");
+        assert_invalid(Literal(Number), "0o8");
+        assert_invalid(Literal(Number), "0xH");
+
+        assert_invalid(Literal(String), "\"\\0a");
+        assert_invalid(Literal(String), "\"\\x");
+        assert_invalid(Literal(String), "\"\\x\"");
+        assert_invalid(Literal(String), "\"\\xA");
+        assert_invalid(Literal(String), "\"\\xAH");
+        assert_invalid(Literal(String), "\"\\xA\"");
+        assert_invalid(Literal(String), "\"\\u");
+        assert_invalid(Literal(String), "\"\\uH");
+        assert_invalid(Literal(String), "\"\\uA");
+        assert_invalid(Literal(String), "\"\\uAA");
+        assert_invalid(Literal(String), "\"\\uAAA");
+        assert_invalid(Literal(String), "\"\\uAAAG");
     }
-    fn assert_valid_type(ty: super::TokenType, text: &str) {
+    fn assert_valid(ty: super::TokenType, text: &str) {
         let mut iter = TokenIter::new(text);
         assert_eq!(
             iter.next(),
@@ -416,8 +525,30 @@ mod tests {
                 space: Space,
                 ty
             }),
-            "token não foi analizado corretamente token: \"{text}\""
+            "token não foi parsado corretamente token: \"{text}\""
         );
         assert_eq!(iter.next(), None);
+        if !iter.errors.is_empty() {
+            panic!(
+                "Houveram erros ao tentar parsar ({text}), que deveria ser correta, erros: {:#?}",
+                iter.errors
+            );
+        }
+    }
+    fn assert_invalid(ty: super::TokenType, text: &str) {
+        let mut iter = TokenIter::new(text);
+        assert_eq!(
+            iter.next(),
+            Some(Token {
+                text,
+                space: Space,
+                ty
+            }),
+            "token não foi parsado corretamente token: \"{text}\""
+        );
+        assert_eq!(iter.next(), None);
+        if iter.errors.is_empty() {
+            panic!("Não houveram erros ao tentar parsar ({text}), que deveria dar um erro");
+        }
     }
 }
