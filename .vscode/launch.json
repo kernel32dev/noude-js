@@ -8,7 +8,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/target/debug/noude.exe",
             "cwd": "${workspaceFolder}",
-            "args": [ "run" ],
+            "args": [ "teste.js" ],
             "sourceLanguages": [ "rust" ]
         }
     ]
