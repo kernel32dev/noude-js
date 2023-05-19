@@ -1,9 +1,15 @@
 
-use std::process::ExitCode;
+use std::{process::ExitCode, rc::Rc, time::Instant};
 
+mod compiler;
+mod operator;
+mod runtime;
 mod syntax;
 mod token;
 mod utils;
+
+/// todo token/syntax: label, with, regexp, generators, class, import, export, for await, {await prop() {}}, template literals, hashbang, bigint
+/// todo compile/runtime: arguments, standard library, assignment, patterns, for, break, continue, switch, case, exceptions, captures, bigint
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -24,14 +30,33 @@ fn main() -> ExitCode {
     };
 
     let mut iter = crate::token::TokenIter::new(contents.as_str());
-    let program = crate::syntax::Program::parse(&mut iter);
+    let script = crate::syntax::Script::parse(&mut iter);
 
-    println!("{:#?}", program);
+    println!("{:#?}", script);
     println!("Erros: {:#?}", iter.errors());
 
-    if iter.errors().is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    if !iter.errors().is_empty() {
+        println!("Houveram erros de syntaxe");
+        return ExitCode::FAILURE;
     }
+
+    let program = match crate::compiler::compile(&script) {
+        Ok(program) => Rc::new(program),
+        Err(errors) =>  {
+            println!("Erros: {:#?}", errors);
+            println!("Houveram erros na compilação");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!("{:#?}", program);
+
+    let start = Instant::now();
+    let output = crate::runtime::execute(program.into());
+    let duration = start.elapsed();
+
+    println!("O programa executou em: {:?}", duration);
+    println!("O programa retornou: {:#?}", output);
+
+    ExitCode::SUCCESS
 }

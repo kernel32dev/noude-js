@@ -1,6 +1,6 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, str::Chars};
 
-use crate::utils::CompError;
+use crate::utils::{offset_str, CompError, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER};
 
 /// um iterador construido a partir de um `&str` que retorna `Token`
 ///
@@ -89,7 +89,12 @@ impl<'a> TokenIter<'a> {
     ///
     /// então retorna Ok(token + expect) e consome o Punct, senão retorna Err(token)
     pub fn join(&mut self, token: &'a str, expect: &str) -> Result<&'a str, &'a str> {
-        if let Some(Token { text, space: _, ty: TokenType::Punct }) = self.current {
+        if let Some(Token {
+            text,
+            space: _,
+            ty: TokenType::Punct,
+        }) = self.current
+        {
             if text == expect {
                 if let Some(joined) = concat_str(self.code, token, text) {
                     self.next();
@@ -178,8 +183,14 @@ impl<'a> TokenIter<'a> {
         if let Some(cover) = cover_str(self.code, left, right) {
             cover
         } else {
-            panic!("TokenIter::cover foi chamado com strings que não estão contidas no código fonte")
+            panic!(
+                "TokenIter::cover foi chamado com strings que não estão contidas no código fonte"
+            )
         }
+    }
+    /// retorna todo o código fonte
+    pub fn code(&self) -> &'a str {
+        self.code
     }
 }
 
@@ -190,12 +201,224 @@ impl<'a> Iterator for TokenIter<'a> {
         let previous = self.current.take();
         self.current = parse_token(&mut self.remaining, &mut self.errors);
         if let Some(previous) = &previous {
-            self.prev_is_eos =
-                previous.space == TokenSpace::Line || previous.text == ";" || previous.text == "}" || previous.text == ":";
+            self.prev_is_eos = previous.space == TokenSpace::Line
+                || previous.text == ";"
+                || previous.text == "}"
+                || previous.text == ":";
         } else {
             self.prev_is_eos = false;
         }
         previous
+    }
+}
+
+pub enum ParsedNumber {
+    Integer(i64),
+    Float(f64),
+}
+
+pub fn parse_number(code: &str) -> ParsedNumber {
+    fn parse_int(code: &str) -> i64 {
+        let (code, negative) = if code.starts_with('-') {
+            (&code[1..], true)
+        } else {
+            (code, false)
+        };
+        let value = code
+            .bytes()
+            .filter(|x| matches!(x, b'0'..=b'9'))
+            .map(|x| (x - b'0') as i64)
+            .reduce(|a, b| a * 10 + b)
+            .unwrap_or(0);
+        if negative {
+            -value
+        } else {
+            value
+        }
+    }
+    fn parse_float(code: &str) -> f64 {
+        if !code.contains('_') {
+            code.parse().unwrap_or(0.0)
+        } else {
+            let mut temp = String::with_capacity(code.len());
+            for char in code.chars() {
+                if char != '_' {
+                    temp.push(char);
+                }
+            }
+            temp.parse().unwrap_or(0.0)
+        }
+    }
+    if code.is_empty() {
+        // houve um erro na tokenização do inteiro, um erro já joi anteriormente emitido
+        ParsedNumber::Integer(0)
+    } else if code == "0" {
+        ParsedNumber::Integer(0)
+    } else if code == "0n" {
+        todo!("BigInt")
+    } else if code.starts_with('0') {
+        let (code, is_bigint) = if code.ends_with('n') {
+            (&code[0..code.len() - 1], true)
+        } else {
+            (code, false)
+        };
+        let bytes = &code.as_bytes()[2..];
+        if !is_bigint {
+            ParsedNumber::Integer(match code.as_bytes()[1] {
+                b'0'..=b'9' => {
+                    if !code.as_bytes().iter().any(|x| matches!(x, b'8'..=b'9')) {
+                        code.as_bytes()
+                            .iter()
+                            .filter(|x| matches!(x, b'0'..=b'7'))
+                            .map(|x| (*x - b'0') as i64)
+                            .reduce(|a, b| a * 0o10 + b)
+                            .unwrap_or(0)
+                    } else {
+                        parse_int(code)
+                    }
+                }
+                b'b' => bytes
+                    .iter()
+                    .filter(|x| matches!(x, b'0'..=b'1'))
+                    .map(|x| (*x - b'0') as i64)
+                    .reduce(|a, b| a * 0b10 + b)
+                    .unwrap_or(0),
+                b'o' => bytes
+                    .iter()
+                    .filter(|x| matches!(x, b'0'..=b'7'))
+                    .map(|x| (*x - b'0') as i64)
+                    .reduce(|a, b| a * 0o10 + b)
+                    .unwrap_or(0),
+                b'x' => bytes
+                    .iter()
+                    .filter(|x| matches!(x, b'0'..=b'9' | b'A'..=b'F' | b'a'..=b'f'))
+                    .map(|x| (*x - b'0') as i64)
+                    .reduce(|a, b| a * 0x10 + b)
+                    .unwrap_or(0),
+                _ => 0,
+            })
+        } else {
+            todo!("BigInt")
+        }
+    } else if code.ends_with('n') {
+        todo!("BigInt")
+    } else {
+        let (number, mut exponent) =
+            if let Some((number, exponent)) = code.split_once(|x| matches!(x, 'e' | 'E')) {
+                (number, parse_int(exponent))
+            } else {
+                (code, 0)
+            };
+        if exponent < 0 || number.contains('.') {
+            let mut acc = parse_float(code);
+            while exponent < 0 {
+                exponent += 1;
+                acc *= 0.1;
+            }
+            ParsedNumber::Float(acc)
+        } else {
+            let mut acc_int = parse_int(number);
+            while MIN_SAFE_INTEGER <= acc_int && acc_int <= MAX_SAFE_INTEGER {
+                if exponent == 0 {
+                    return ParsedNumber::Integer(acc_int);
+                }
+                exponent -= 1;
+                acc_int *= 10;
+            }
+            let mut acc_float = acc_int as f64;
+            while exponent > 0 {
+                exponent -= 1;
+                acc_float *= 10.0;
+            }
+            ParsedNumber::Float(acc_float)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedString<'a> {
+    remaining: Chars<'a>,
+    /// indica que o ultimo caractere foi um que precisa de dois u16 para ser mostrado
+    ///
+    /// o primeiro código já foi retornado, aqui esta o segundo para ser retornado na proxima chamada de next
+    second_half: Option<u16>,
+}
+
+pub fn parse_string<'a>(code: &'a str) -> ParsedString<'a> {
+    let contents = if code.is_empty() {
+        // a string não foi parsada corretamente
+        // bota uma string vazia
+        code
+    } else {
+        // remover aspas
+        &code[1..code.len() - 1]
+    };
+    ParsedString {
+        remaining: contents.chars(),
+        second_half: None,
+    }
+}
+
+impl<'a> Iterator for ParsedString<'a> {
+    type Item = u16;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(second_half) = self.second_half.take() {
+            return Some(second_half);
+        }
+        let character = match self.remaining.next()? {
+            '\\' => match self.remaining.next()? {
+                digit @ '0'..='3' => {
+                    let mut unicode = digit as u32 - b'0' as u32;
+                    unicode = unicode * 0x10 + self.remaining.next()? as u32 - b'0' as u32;
+                    unicode = unicode * 0x10 + self.remaining.next()? as u32 - b'0' as u32;
+                    unicode.try_into().expect("esse escape inválido deveria ter sido eliminado durante a analise da sintaxe")
+                }
+                digit @ '4'..='7' => {
+                    let mut unicode = digit as u32 - b'0' as u32;
+                    unicode = unicode * 0x10 + self.remaining.next()? as u32 - b'0' as u32;
+                    unicode.try_into().expect("esse escape inválido deveria ter sido eliminado durante a analise da sintaxe")
+                }
+                'x' => {
+                    let mut unicode = hex_char_to_int(self.remaining.next()?) as u32;
+                    unicode = unicode * 0x10 + hex_char_to_int(self.remaining.next()?) as u32;
+                    unicode.try_into().expect("esse escape inválido deveria ter sido eliminado durante a analise da sintaxe")
+                }
+                'u' => {
+                    let mut unicode: u32 = 0;
+                    let first = self.remaining.next()?;
+                    if first == '{' {
+                        loop {
+                            let digit = self.remaining.next()?;
+                            if digit == '}' {
+                                break;
+                            }
+                            unicode = unicode * 0x10 + hex_char_to_int(digit) as u32;
+                        }
+                    } else {
+                        for _ in 0..4 {
+                            unicode =
+                                unicode * 0x10 + hex_char_to_int(self.remaining.next()?) as u32;
+                        }
+                    }
+                    unicode.try_into().expect("esse escape inválido deveria ter sido eliminado durante a analise da sintaxe")
+                }
+                'b' => 8 as char,
+                't' => 9 as char,
+                'n' => 10 as char,
+                'v' => 11 as char,
+                'f' => 12 as char,
+                'r' => 13 as char,
+                escape => escape,
+            },
+            character => character,
+        };
+        if (character as u32) < 0x10000 {
+            return Some(character as u16);
+        }
+        let high_half = 0xD800 + ((character as u32) / 0x10000) as u16;
+        let low_half = 0xDC00 + ((character as u32) % 0x10000) as u16;
+        self.second_half = Some(low_half);
+        Some(high_half)
     }
 }
 
@@ -254,15 +477,10 @@ fn parse_token_number<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -
         code,
         find(code, |x| !(x == b'.' || x == b'-' || is_word_byte(x))),
     );
-    let token = Token {
-        text,
-        space: parse_space(code, errors),
-        ty: TokenType::Number,
-    };
-    if text == "0" || text == "0n" {
-        return token;
-    }
-    if text.starts_with('0') {
+    let space = parse_space(code, errors);
+    let valid = if text == "0" || text == "0n" {
+        true
+    } else if text.starts_with('0') {
         let (text, is_bigint) = if text.ends_with('n') {
             (&text[0..text.len() - 1], true)
         } else {
@@ -275,58 +493,52 @@ fn parse_token_number<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -
             && bytes.last() != Some(&b'_')
             && match text.as_bytes()[1] {
                 b'0'..=b'9' => !is_bigint && iter.all(|x| matches!(x, b'0'..=b'9')),
-                b'b' => iter.all(|x| matches!(x, b'0' | b'1')),
+                b'b' => iter.all(|x| matches!(x, b'0'..=b'1')),
                 b'o' => iter.all(|x| matches!(x, b'0'..=b'7')),
                 b'x' => iter.all(|x| matches!(x, b'0'..=b'9' | b'A'..=b'F' | b'a'..=b'f')),
                 _ => false,
             };
-        if !valid {
-            errors.push(CompError::new(
-                text,
-                "literal numérico inválido".into(),
-            ));
-        }
+        valid
     } else if text.ends_with('n') {
-        if !validate(&text[0..text.len() - 1]) {
-            errors.push(CompError::new(text,
-                "literal numérico inválido".into(),
-            ));
-        }
+        validate(&text[0..text.len() - 1])
     } else {
-        let number = if let Some((number, exponent)) = text.split_once(|x| matches!(x, 'e' | 'E')) {
-            let exponent_valid = if exponent.starts_with('-') {
-                validate(&exponent[1..])
+        let (number, exponent) =
+            if let Some((number, mut exponent)) = text.split_once(|x| matches!(x, 'e' | 'E')) {
+                if exponent.starts_with('-') {
+                    exponent = &exponent[1..];
+                }
+                (number, Some(exponent))
             } else {
-                validate(exponent)
+                (text, None)
             };
-            if !exponent_valid {
-                errors.push(CompError::new(text,
-                    "literal numérico inválido".into(),
-                ));
-                return token;
-            }
-            number
+        let (integer, fraction) = if let Some((integer, fraction)) = number.split_once('.') {
+            (integer, Some(fraction))
         } else {
-            text
+            (number, None)
         };
-        let number_valid = if let Some((integer, fraction)) = number.split_once('.') {
-            validate(integer) && validate(fraction)
-        } else {
-            validate(number)
+        validate(integer)
+            && fraction.map(validate).unwrap_or(true)
+            && exponent.map(validate).unwrap_or(true)
+    };
+    if !valid {
+        errors.push(CompError::new(text, "literal numérico inválido".into()));
+        return Token {
+            text: &text[0..0],
+            space,
+            ty: TokenType::Number,
         };
-        if !number_valid {
-            errors.push(CompError::new(text,
-                "literal numérico inválido".into(),
-            ));
-            return token;
-        }
     }
-    return token;
+    return Token {
+        text,
+        space,
+        ty: TokenType::Number,
+    };
 }
 
 fn parse_token_string<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -> Token<'a> {
     let delimiter = code.as_bytes()[0];
     let bytes = code.as_bytes();
+    let mut has_errors = false;
     let mut iter = 1..bytes.len();
     'outer: while let Some(index) = iter.next() {
         match bytes[index] {
@@ -335,7 +547,7 @@ fn parse_token_string<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -
                     break;
                 };
                 match bytes[index] {
-                    b'0'..=b'7' => {
+                    b'0'..=b'3' => {
                         // obter até mais 2 caracteres octais
                         for offset in 1..=2 {
                             if index + offset < bytes.len()
@@ -347,18 +559,71 @@ fn parse_token_string<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -
                             }
                         }
                     }
+                    b'4'..=b'7' => {
+                        // obter até mais 1 caracteres octais
+                        if index + 1 < bytes.len() && matches!(bytes[index + 1], b'0'..=b'7') {
+                            iter.next();
+                        }
+                    }
                     b'u' => {
-                        // obter exatamente 4 caracteres hexadecimais
-                        for _ in 0..4 {
-                            let Some(index) = iter.next() else {
-                                break 'outer;
-                            };
-                            if !matches!(bytes[index], b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F') {
+                        if index + 1 < bytes.len() && bytes[index + 1] == b'{' {
+                            iter.next();
+                            const LARGEST_UNICODE_CODE_POINT: u32 = 0x10FFFF;
+                            let mut unicode = 0;
+                            let mut is_empty = true;
+                            // obter de 1 a 6 caracteres hexadecimais
+                            loop {
+                                let Some(index) = iter.next() else {
+                                    break 'outer;
+                                };
+                                if matches!(bytes[index], b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F') {
+                                    is_empty = false;
+                                    if unicode != u32::MAX {
+                                        unicode =
+                                            unicode * 0x10 + hex_byte_to_int(bytes[index]) as u32;
+                                        if unicode > LARGEST_UNICODE_CODE_POINT {
+                                            unicode = u32::MAX;
+                                        }
+                                    }
+                                } else if bytes[index] == b'}' {
+                                    if is_empty {
+                                        has_errors = true;
+                                        errors.push(CompError::new(
+                                            &code[index..index + 1],
+                                            "esperado caractere hexadecimal".into(),
+                                        ));
+                                    }
+                                    break;
+                                } else {
+                                    has_errors = true;
+                                    errors.push(CompError::new(
+                                        &code[index..index + 1],
+                                        "esperado caractere hexadecimal".into(),
+                                    ));
+                                    break;
+                                }
+                            }
+                            if unicode == u32::MAX || TryInto::<char>::try_into(unicode).is_err() {
+                                has_errors = true;
                                 errors.push(CompError::new(
                                     &code[index..index + 1],
-                                    "esperado caractere hexadecimal".into(),
-                                    
-                                ))
+                                    "código unicode inválido".into(),
+                                ));
+                            }
+                        } else {
+                            // obter exatamente 4 caracteres hexadecimais
+                            for _ in 0..4 {
+                                let Some(index) = iter.next() else {
+                                    break 'outer;
+                                };
+                                if !matches!(bytes[index], b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F')
+                                {
+                                    has_errors = true;
+                                    errors.push(CompError::new(
+                                        &code[index..index + 1],
+                                        "esperado caractere hexadecimal".into(),
+                                    ))
+                                }
                             }
                         }
                     }
@@ -369,6 +634,7 @@ fn parse_token_string<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -
                                 break 'outer;
                             };
                             if !matches!(bytes[index], b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F') {
+                                has_errors = true;
                                 errors.push(CompError::new(
                                     &code[index..index + 1],
                                     "esperado caractere hexadecimal".into(),
@@ -376,31 +642,45 @@ fn parse_token_string<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -
                             }
                         }
                     }
-                    0..=31 | 127 => errors.push(CompError::new(
-                        &code[index..index + 1],
-                        "caractere invalido".into(),
-                    )),
+                    0..=31 | 127 => {
+                        has_errors = true;
+                        errors.push(CompError::new(
+                            &code[index..index + 1],
+                            "caractere invalido".into(),
+                        ))
+                    }
                     _ => {} // os outros caracteres, ou são escapes inválidos,
                             // ou são válidos e ocupam apenas um caractere e não requerem validação
                 }
             }
             b'\t' | 32..=126 | 128.. => {
                 if bytes[index] == delimiter {
+                    let text = if has_errors {
+                        &parse_slice(code, index + 1)[0..0]
+                    } else {
+                        parse_slice(code, index + 1)
+                    };
                     return Token {
-                        text: parse_slice(code, index + 1),
+                        text,
                         space: parse_space(code, errors),
                         ty: TokenType::String,
                     };
                 }
             }
-            b'\r' | b'\n' => errors.push(CompError::new(
-                &code[index - 1..index],
-                "string não terminada".into(),
-            )),
-            0..=31 | 127 => errors.push(CompError::new(
-                &code[index..index + 1],
-                "caractere invalido".into(),
-            )),
+            b'\r' | b'\n' => {
+                has_errors = true;
+                errors.push(CompError::new(
+                    &code[index - 1..index],
+                    "string não terminada".into(),
+                ))
+            }
+            0..=31 | 127 => {
+                has_errors = true;
+                errors.push(CompError::new(
+                    &code[index..index + 1],
+                    "caractere invalido".into(),
+                ))
+            }
         }
     }
     errors.push(CompError::new(
@@ -408,7 +688,7 @@ fn parse_token_string<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -
         "string não terminada".into(),
     ));
     Token {
-        text: parse_slice(code, code.len()),
+        text: &parse_slice(code, code.len())[0..0],
         space: parse_space(code, errors),
         ty: TokenType::String,
     }
@@ -501,6 +781,7 @@ fn parse_space<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -> Token
     for index in 0..bytes.len() {
         match bytes[index] {
             b' ' | b'\t' => {}
+            // todo!() 0x2028 (0xE2 0x80 0xA8) e 0x2029 (0xE2 0x80 0xA9) também são quebras de linha
             b'\n' | b'\r' => {
                 if comment == Comment::Line {
                     comment = Comment::None;
@@ -508,11 +789,17 @@ fn parse_space<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -> Token
                 found_new_line = true;
             }
             // começo de comentário de linha
-            b'/' if comment == Comment::None && index + 1 < bytes.len() && bytes[index + 1] == b'/' => {
+            b'/' if comment == Comment::None
+                && index + 1 < bytes.len()
+                && bytes[index + 1] == b'/' =>
+            {
                 comment = Comment::Line
             }
             // começo de comentário de bloco
-            b'/' if comment == Comment::None && index + 1 < bytes.len() && bytes[index + 1] == b'*' => {
+            b'/' if comment == Comment::None
+                && index + 1 < bytes.len()
+                && bytes[index + 1] == b'*' =>
+            {
                 comment = Comment::Block
             }
             // fim de comentário de bloco
@@ -537,7 +824,10 @@ fn parse_space<'a>(code: &mut &'a str, errors: &mut Vec<CompError<'a>>) -> Token
     }
     parse_slice(code, code.len());
     if comment == Comment::Block {
-        errors.push(CompError { src: code, desc: "Esperado */".into() })
+        errors.push(CompError {
+            src: code,
+            desc: "Esperado */".into(),
+        })
     }
     if found_new_line {
         TokenSpace::Line
@@ -608,11 +898,11 @@ mod tests {
         iter.test_next("2", Joint, Number);
         iter.test_next(")", Joint, Punct);
         iter.test_next(")", Joint, Punct);
-        iter.test_next(";", Space, Punct);
+        iter.test_next(";", Line, Punct);
         assert_eq!(iter.next(), None);
     }
     #[test]
-    fn teste_literais_ok() {
+    fn teste_literais() {
         assert_valid(Number, "1");
         assert_valid(Number, "1.1");
         assert_valid(Number, "1.");
@@ -638,6 +928,10 @@ mod tests {
         assert_valid(String, "\"\\012a\"");
         assert_valid(String, "'\\xFF'");
         assert_valid(String, "'\\uABCD'");
+        assert_valid(String, "\"\\u{0}\"");
+        assert_valid(String, "\"\\u{10FFFF}\"");
+        assert_valid(String, "\"\\u{000000}\"");
+        assert_valid(String, "\"\\u{00000000}\"");
 
         assert_invalid(Number, "1_");
         assert_invalid(Number, "1_.1");
@@ -670,6 +964,15 @@ mod tests {
         assert_invalid(String, "\"\\uAA");
         assert_invalid(String, "\"\\uAAA");
         assert_invalid(String, "\"\\uAAAG");
+        assert_invalid(String, "\"\\u{");
+        assert_invalid(String, "\"\\u{}");
+        assert_invalid(String, "\"\\u{G");
+        assert_invalid(String, "\"\\u{\"");
+        assert_invalid(String, "\"\\u{}\"");
+        assert_invalid(String, "\"\\u{110000}\"");
+        assert_invalid(String, "\"\\u{0000000}\"");
+        assert_invalid(String, "\"\\u{\"");
+        assert_invalid(String, "\"\\u{G\"");
     }
     fn assert_valid(ty: super::TokenType, text: &str) {
         let mut iter = TokenIter::new(text);
@@ -677,7 +980,7 @@ mod tests {
             iter.next(),
             Some(Token {
                 text,
-                space: Space,
+                space: Line,
                 ty
             }),
             "token não foi parsado corretamente token: \"{text}\""
@@ -692,13 +995,8 @@ mod tests {
     }
     fn assert_invalid(ty: super::TokenType, text: &str) {
         let mut iter = TokenIter::new(text);
-        assert_eq!(
-            iter.next(),
-            Some(Token {
-                text,
-                space: Space,
-                ty
-            }),
+        assert!(
+            iter.next().map(|x| x.ty == ty).unwrap_or(false),
             "token não foi parsado corretamente token: \"{text}\""
         );
         assert_eq!(iter.next(), None);
@@ -712,8 +1010,8 @@ mod tests {
 ///
 /// se left e right não estão adjacentes na memória, retorna None
 fn concat_str<'a>(all: &'a str, left: &'a str, right: &'a str) -> Option<&'a str> {
-    let left_index = offset_from(all, left)?;
-    let right_index = offset_from(all, right)?;
+    let left_index = offset_str(all, left)?;
+    let right_index = offset_str(all, right)?;
     if left_index + left.len() == right_index {
         Some(&all[left_index..right_index + right.len()])
     } else {
@@ -729,8 +1027,8 @@ fn concat_str<'a>(all: &'a str, left: &'a str, right: &'a str) -> Option<&'a str
 ///
 /// mas é garantido que a string retornada sempre existe dentro de all
 fn cover_str<'a>(all: &'a str, left: &'a str, right: &'a str) -> Option<&'a str> {
-    let left_index = offset_from(all, left)?;
-    let right_index = offset_from(all, right)?;
+    let left_index = offset_str(all, left)?;
+    let right_index = offset_str(all, right)?;
     if left_index > right_index {
         None
     } else if left_index + left.len() >= right_index + right.len() {
@@ -741,35 +1039,20 @@ fn cover_str<'a>(all: &'a str, left: &'a str, right: &'a str) -> Option<&'a str>
     }
 }
 
-/// se substr estiver contido dentro de all, retorna o index de substr dentro de all
-///
-/// ```ignore
-/// let all = " ABC ABC ";
-/// let substr = &all[5..8];
-/// 
-/// assert_eq!(substr, "ABC");
-/// 
-/// let offset = offset_from(all, substr).unwrap();
-///
-/// assert_eq!(offset, 5);
-/// 
-/// let substr_2 = &all[offset..offset + substr.len()];
-/// 
-/// assert_eq!(substr, substr_2);
-/// 
-/// let other_str = "somewhere else";
-/// 
-/// let offset = offset_from(all, other_str);
-///
-/// assert_eq!(offset, None);
-/// ```
-fn offset_from<'a>(all: &'a str, substr: &'a str) -> Option<usize> {
-    unsafe {
-        let index: usize = substr.as_ptr().offset_from(all.as_ptr()).try_into().ok()?;
-        if index + substr.len() <= all.len() {
-            Some(index)
-        } else {
-            None
-        }
+fn hex_byte_to_int(digit: u8) -> u8 {
+    match digit {
+        b'0'..=b'9' => digit - b'0',
+        b'a'..=b'f' => digit - b'a' + 10,
+        b'A'..=b'F' => digit - b'A' + 10,
+        _ => panic!("hex_byte_to_int foi chamado com um digito que não é um hex"),
+    }
+}
+
+fn hex_char_to_int(digit: char) -> u8 {
+    match digit {
+        '0'..='9' => digit as u8 - b'0',
+        'a'..='f' => digit as u8 - b'a' + 10,
+        'A'..='F' => digit as u8 - b'A' + 10,
+        _ => panic!("hex_char_to_int foi chamado com um digito que não é um hex"),
     }
 }

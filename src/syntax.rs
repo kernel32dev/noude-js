@@ -14,7 +14,10 @@ pub type src = str;
 
 /// uma lista de Statement, na raiz do arquivo
 #[derive(Debug, Clone)]
-pub struct Program<'a>(pub Vec<Statement<'a>>);
+pub struct Script<'a> {
+    pub code: &'a src,
+    pub body: Vec<Statement<'a>>,
+}
 
 /// uma lista de Statement, representa código dentro de chaves
 #[derive(Debug, Clone)]
@@ -27,6 +30,7 @@ pub struct Statements<'a>(pub Vec<Statement<'a>>);
 pub enum Statement<'a> {
     /// function name(args = expr, ...) {}
     Function {
+        src: &'a src,
         is_async: Option<&'a src>,
         name: &'a str,
         args: Patterns<'a>,
@@ -172,19 +176,32 @@ pub enum Assignee<'a> {
     Rest(&'a src, Box<Assignee<'a>>),
 }
 
+/// uma expressão ao qual podemos usar o Assign (=), os outros tipos de assign (+=, -=, *=, etc.) e o incrementa / decrementa (++,--)
+#[derive(Debug, Clone)]
+pub enum SimpleAssignee<'a> {
+    /// `foo = ...`
+    Identifier(&'a str),
+    /// `obj.member = ...`
+    Member(&'a src, Expr<'a>, &'a str),
+    /// `obj[0] = ...`
+    Index(&'a src, Expr<'a>, Expr<'a>),
+}
+
 /// uma expressão de javascript, pode ser qualquer
 /// coisa que quando executada resulta em um valor
 ///
 /// QUALQUER COISA
 #[derive(Debug, Clone)]
 pub enum Expr<'a> {
+    /// ocorreu um erro ao evaluar uma expressão
+    ///
+    /// o valor disto é undefined
+    Error,
     // expressões primarias (ExprPart::Value)
-    Undefined(&'a src),
     Null(&'a src),
     True(&'a src),
     False(&'a src),
     This(&'a src),
-    Parameters(&'a src),
     NewTarget(&'a src),
     /// um identificador solitário
     Identifier(&'a str),
@@ -219,6 +236,11 @@ pub enum Expr<'a> {
     /// uma chamada de new, com argumentos
     NewCall(&'a src, Box<(Expr<'a>, Vec<Expr<'a>>)>),
 
+    PreIncrement(&'a src, Box<SimpleAssignee<'a>>),
+    PreDecrement(&'a src, Box<SimpleAssignee<'a>>),
+    PostIncrement(&'a src, Box<SimpleAssignee<'a>>),
+    PostDecrement(&'a src, Box<SimpleAssignee<'a>>),
+
     // expressões com operadores
     /// expressão com um operador que fica depois do valor, ex: i++
     Postfix(Box<(Expr<'a>, ExprPostfix<'a>)>),
@@ -229,7 +251,9 @@ pub enum Expr<'a> {
     /// expressão com o operador ternário, ex: condicao ? "sim" : "não"
     Ternary(Box<(Expr<'a>, Expr<'a>, Expr<'a>)>),
     /// expressão onde hà escrita de um valor
-    Assign(Box<(Assignee<'a>, ExprInfixAssign<'a>, Expr<'a>)>),
+    Assign(Box<(Assignee<'a>, Expr<'a>)>),
+    /// expressão onde hà escrita de um valor, com um operador compound (+=, -=, etc)
+    CompoundAssign(Box<(SimpleAssignee<'a>, ExprInfixCompoundAssign<'a>, Expr<'a>)>),
     /// uma expressão com ... antes dela, válido apenas em certas circunstâncias, ex: ...iterador
     Spread(&'a src, Box<Expr<'a>>),
 }
@@ -266,7 +290,6 @@ pub enum ExprPostfix<'a> {
     Call(&'a src, Vec<Expr<'a>>),
     Index(&'a src, Expr<'a>),
     Member(&'a src, &'a str),
-    MemberOpt(&'a src, &'a str),
     PostIncrement(&'a src),
     PostDecrement(&'a src),
 }
@@ -282,7 +305,7 @@ pub enum ExprInfix<'a> {
     Subtract(&'a src),
     BitwiseLeft(&'a src),
     BitwiseRight(&'a src),
-    BitwiseLeftUnsigned(&'a src),
+    BitwiseRightUnsigned(&'a src),
     Less(&'a src),
     LessEqual(&'a src),
     Greater(&'a src),
@@ -301,14 +324,14 @@ pub enum ExprInfix<'a> {
     Coalesce(&'a src),
     TernaryQuestion(&'a src),
     TernaryAnswer(&'a src),
-    Assign(ExprInfixAssign<'a>),
+    Assign(&'a src),
+    CompoundAssign(ExprInfixCompoundAssign<'a>),
     Comma(&'a src),
 }
 
 /// representa um operador que vem entre um Assignee e um Expr
 #[derive(Debug, Clone)]
-pub enum ExprInfixAssign<'a> {
-    Assign(&'a src),
+pub enum ExprInfixCompoundAssign<'a> {
     Power(&'a src),
     Add(&'a src),
     Subtract(&'a src),
@@ -317,21 +340,24 @@ pub enum ExprInfixAssign<'a> {
     Remainder(&'a src),
     BitwiseLeft(&'a src),
     BitwiseRight(&'a src),
-    BitwiseLeftUnsigned(&'a src),
+    BitwiseRightUnsigned(&'a src),
     BitwiseAnd(&'a src),
     BitwiseXor(&'a src),
     BitwiseOr(&'a src),
     Coalesce(&'a src),
 }
 
-impl<'a> Program<'a> {
+impl<'a> Script<'a> {
     pub fn parse(iter: &mut TokenIter<'a>) -> Self {
-        let mut statements = Vec::new();
+        let mut body = Vec::new();
         while !iter.eof() {
-            statements.push(Statement::parse(iter));
+            body.push(Statement::parse(iter));
             iter.next_eos();
         }
-        Self(statements)
+        Self {
+            code: iter.code(),
+            body,
+        }
     }
 }
 impl<'a> Statements<'a> {
@@ -354,6 +380,7 @@ impl<'a> Statement<'a> {
     fn parse(iter: &mut TokenIter<'a>) -> Self {
         match iter.text() {
             "async" | "function" => {
+                let src = iter.text();
                 let is_async = if let Some(is_async) = iter.consume_text("async") {
                     parse_token(iter, "function", "Esperado function após async");
                     Some(is_async)
@@ -367,6 +394,7 @@ impl<'a> Statement<'a> {
                 parse_token(iter, ")", "Esperado )");
                 let body = Statements::parse(iter);
                 Self::Function {
+                    src,
                     is_async,
                     name,
                     args,
@@ -744,16 +772,46 @@ impl<'a> Pattern<'a> {
             iter.error_at(default.src(iter), message);
         }
     }
+    /// chama callback com todos os identificadores que esse pattern declara, na ordem que eles aparecem no código
+    pub fn for_each_declared(&self, callback: &mut impl FnMut(&'a str)) {
+        match self {
+            Self::Identifier(identifier, _) => {
+                callback(&identifier);
+            }
+            Self::Array(_, array, _) => {
+                for pat in array {
+                    pat.for_each_declared(callback);
+                }
+            }
+            Self::Object(_, object, _) => {
+                for (_, pat) in object {
+                    pat.for_each_declared(callback);
+                }
+            }
+            Self::Rest(_, rest) => {
+                rest.for_each_declared(callback);
+            }
+        }
+    }
 }
 impl<'a> Assignee<'a> {
     fn src(&self) -> &'a src {
         match self {
-            Assignee::Identifier(src)
-            | Assignee::Array(src, _)
-            | Assignee::Object(src, _)
-            | Assignee::Member(src, _, _)
-            | Assignee::Index(src, _, _)
-            | Assignee::Rest(src, _) => src,
+            Self::Identifier(src)
+            | Self::Array(src, _)
+            | Self::Object(src, _)
+            | Self::Member(src, _, _)
+            | Self::Index(src, _, _)
+            | Self::Rest(src, _) => src,
+        }
+    }
+}
+impl<'a> SimpleAssignee<'a> {
+    fn src(&self) -> &'a src {
+        match self {
+            Self::Identifier(src)
+            | Self::Member(src, _, _)
+            | Self::Index(src, _, _) => src,
         }
     }
 }
@@ -786,12 +844,10 @@ impl<'a> Expr<'a> {
                         "void" => ExprPrefix::Void(iter.take_text()),
                         "await" => ExprPrefix::Await(iter.take_text()),
                         // VALUE
-                        "undefined" => break Expr::Undefined(iter.take_text()),
                         "null" => break Expr::Null(iter.take_text()),
                         "true" => break Expr::True(iter.take_text()),
                         "false" => break Expr::False(iter.take_text()),
                         "this" => break Expr::This(iter.take_text()),
-                        "parameters" => break Expr::Parameters(iter.take_text()),
                         "async" | "function" => {
                             let mut src = iter.text();
                             let is_async = iter.consume_text("async");
@@ -870,12 +926,12 @@ impl<'a> Expr<'a> {
                                 }
                             } else {
                                 iter.error("Esperado function ou () => {}");
-                                break Expr::Undefined("");
+                                break Expr::Error;
                             }
                         }
                         _ => {
                             iter.error("Esperado um valor");
-                            break Expr::Undefined("");
+                            break Expr::Error;
                         }
                     },
                     Some(TokenType::Punct) => match iter.text() {
@@ -921,9 +977,24 @@ impl<'a> Expr<'a> {
                                     src = iter.cover(src, src_end);
                                     break;
                                 }
+                                let is_async = iter.consume_text("async");
                                 // TODO! add more property types (string literal as key, get property, set property, computed property, prototype, and spread)
                                 let key = parse_identifier(iter);
-                                let value = if iter.consume(":") {
+                                let value = if let Some(is_async) = is_async {
+                                    let args = Patterns::parse_opt(iter, false);
+                                    parse_token(iter, ")", "Esperado )");
+                                    if iter.text() != "{" {
+                                        iter.error("Esperado {");
+                                    }
+                                    let body = Statements::parse(iter);
+                                    Expr::Function {
+                                        src: key,
+                                        is_async: Some(is_async),
+                                        name: Some(key),
+                                        args,
+                                        body,
+                                    }
+                                } else if iter.consume(":") {
                                     Expr::parse(iter)
                                 } else if iter.consume("(") {
                                     let args = Patterns::parse_opt(iter, false);
@@ -956,12 +1027,12 @@ impl<'a> Expr<'a> {
                         }
                         _ => {
                             iter.error("Esperado um valor");
-                            break Expr::Undefined("");
+                            break Expr::Error;
                         }
                     },
                     None => {
                         iter.error("Esperado um valor");
-                        break Expr::Undefined("");
+                        break Expr::Error;
                     }
                 };
                 parts.push(ExprPart::Prefix(prefix));
@@ -999,7 +1070,7 @@ impl<'a> Expr<'a> {
                         if let Ok(token) = iter.join(token, "+") {
                             ExprPostfix::PostIncrement(token)
                         } else if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::Assign(ExprInfixAssign::Add(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Add(token));
                         } else {
                             break ExprInfix::Add(token);
                         }
@@ -1009,29 +1080,29 @@ impl<'a> Expr<'a> {
                         if let Ok(token) = iter.join(token, "-") {
                             ExprPostfix::PostDecrement(token)
                         } else if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::Assign(ExprInfixAssign::Multiply(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Subtract(token));
                         } else {
-                            break ExprInfix::Multiply(token);
+                            break ExprInfix::Subtract(token);
                         }
                     }
                     "*" => {
                         let token = iter.take_text();
                         if let Ok(token) = iter.join(token, "*") {
                             if let Ok(token) = iter.join(token, "*") {
-                                break ExprInfix::Assign(ExprInfixAssign::Power(token));
+                                break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Power(token));
                             } else {
                                 break ExprInfix::Power(token);
                             }
                         } else if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::Assign(ExprInfixAssign::Subtract(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Multiply(token));
                         } else {
-                            break ExprInfix::Subtract(token);
+                            break ExprInfix::Multiply(token);
                         }
                     }
                     "/" => {
                         let token = iter.take_text();
                         if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::Assign(ExprInfixAssign::Divide(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Divide(token));
                         } else {
                             break ExprInfix::Divide(token);
                         }
@@ -1039,7 +1110,7 @@ impl<'a> Expr<'a> {
                     "%" => {
                         let token = iter.take_text();
                         if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::Assign(ExprInfixAssign::Remainder(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Remainder(token));
                         } else {
                             break ExprInfix::Remainder(token);
                         }
@@ -1053,7 +1124,7 @@ impl<'a> Expr<'a> {
                                 break ExprInfix::Equal(token);
                             }
                         } else {
-                            break ExprInfix::Assign(ExprInfixAssign::Assign(token));
+                            break ExprInfix::Assign(token);
                         }
                     }
                     "!" => {
@@ -1074,16 +1145,16 @@ impl<'a> Expr<'a> {
                         if let Ok(token) = iter.join(token, ">") {
                             if let Ok(token) = iter.join(token, ">") {
                                 if let Ok(token) = iter.join(token, "=") {
-                                    break ExprInfix::Assign(ExprInfixAssign::BitwiseLeftUnsigned(
+                                    break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseRightUnsigned(
                                         token,
                                     ));
                                 } else {
-                                    break ExprInfix::BitwiseLeftUnsigned(token);
+                                    break ExprInfix::BitwiseRightUnsigned(token);
                                 }
                             } else if let Ok(token) = iter.join(token, "=") {
-                                break ExprInfix::Assign(ExprInfixAssign::BitwiseLeft(token));
+                                break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseRight(token));
                             } else {
-                                break ExprInfix::BitwiseLeft(token);
+                                break ExprInfix::BitwiseRight(token);
                             }
                         } else if let Ok(token) = iter.join(token, "=") {
                             break ExprInfix::GreaterEqual(token);
@@ -1095,9 +1166,9 @@ impl<'a> Expr<'a> {
                         let token = iter.take_text();
                         if let Ok(token) = iter.join(token, "<") {
                             if let Ok(token) = iter.join(token, "=") {
-                                break ExprInfix::Assign(ExprInfixAssign::BitwiseRight(token));
+                                break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseLeft(token));
                             } else {
-                                break ExprInfix::BitwiseRight(token);
+                                break ExprInfix::BitwiseLeft(token);
                             }
                         } else if let Ok(token) = iter.join(token, "=") {
                             break ExprInfix::LessEqual(token);
@@ -1110,7 +1181,7 @@ impl<'a> Expr<'a> {
                         if let Ok(token) = iter.join(token, "&") {
                             break ExprInfix::And(token);
                         } else if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::Assign(ExprInfixAssign::BitwiseAnd(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseAnd(token));
                         } else {
                             break ExprInfix::BitwiseAnd(token);
                         }
@@ -1120,7 +1191,7 @@ impl<'a> Expr<'a> {
                         if let Ok(token) = iter.join(token, "|") {
                             break ExprInfix::Or(token);
                         } else if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::Assign(ExprInfixAssign::BitwiseOr(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseOr(token));
                         } else {
                             break ExprInfix::BitwiseOr(token);
                         }
@@ -1128,31 +1199,24 @@ impl<'a> Expr<'a> {
                     "^" => {
                         let token = iter.take_text();
                         if let Ok(token) = iter.join(token, "^") {
-                            break ExprInfix::Assign(ExprInfixAssign::BitwiseXor(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseXor(token));
                         } else {
                             break ExprInfix::BitwiseXor(token);
                         }
                     }
                     "?" => {
                         let token = iter.take_text();
-                        match iter.join(token, ".") {
-                            Ok(token) => {
-                                let member = parse_identifier(iter);
-                                ExprPostfix::MemberOpt(iter.cover(token, member), member)
-                                // ?.
-                            }
-                            Err(token) => match iter.join(token, "?") {
-                                Ok(token) => match iter.join(token, "=") {
-                                    Ok(token) => {
-                                        break ExprInfix::Assign(ExprInfixAssign::Coalesce(token))
-                                    }
-                                    Err(token) => break ExprInfix::Coalesce(token),
-                                },
-                                Err(token) => {
-                                    ternary_depth += 1;
-                                    break ExprInfix::TernaryQuestion(token);
+                        match iter.join(token, "?") {
+                            Ok(token) => match iter.join(token, "=") {
+                                Ok(token) => {
+                                    break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Coalesce(token))
                                 }
+                                Err(token) => break ExprInfix::Coalesce(token),
                             },
+                            Err(token) => {
+                                ternary_depth += 1;
+                                break ExprInfix::TernaryQuestion(token);
+                            }
                         }
                     }
                     // se o dois pontos for encontrada, mas ternary_depth for 0, significa que a expressão acabou
@@ -1179,7 +1243,7 @@ impl<'a> Expr<'a> {
                             parts.reserve(ternary_depth * 2);
                             for _ in 0..ternary_depth {
                                 parts.push(ExprPart::Infix(ExprInfix::TernaryAnswer("")));
-                                parts.push(ExprPart::Value(Expr::Undefined("")));
+                                parts.push(ExprPart::Value(Expr::Error));
                             }
                         }
                         // um operador postfix não foi encontrado, nem um infix, termina a expressão
@@ -1223,11 +1287,11 @@ impl<'a> Expr<'a> {
                         Expr::Spread(token, Box::new(Expr::parse(iter)))
                     } else {
                         iter.error("Esperado ...");
-                        Expr::Spread(token, Box::new(Expr::Undefined("")))
+                        Expr::Spread(token, Box::new(Expr::Error))
                     }
                 } else {
                     iter.error("Esperado ...");
-                    Expr::Spread(token, Box::new(Expr::Undefined("")))
+                    Expr::Spread(token, Box::new(Expr::Error))
                 }
             };
             exprs.push(expr);
@@ -1283,61 +1347,15 @@ impl<'a> Expr<'a> {
     }
     /// constroi uma nova expressão a partir de uma lista de ExprPart
     fn from_parts(iter: &mut TokenIter<'a>, parts: &mut [ExprPart<'a>]) -> Self {
-        match parts.len() {
-            0 => panic!("Expr::from_parts chamado com um array vazio"),
-            1 => match parts[0].take() {
-                ExprPart::Value(value) => return value,
-                _ => panic!("Expr::from_parts chamado com um array de tamanho 1 inválido"),
-            },
-            2 => match (parts[0].take(), parts[1].take()) {
-                (ExprPart::Prefix(prefix), ExprPart::Value(value)) => {
-                    return Expr::Prefix(Box::new((prefix, value)))
-                }
-                (ExprPart::Value(value), ExprPart::Postfix(postfix)) => {
-                    return Expr::Postfix(Box::new((value, postfix)))
-                }
-                _ => panic!("Expr::from_parts chamado com um array de tamanho 2 inválido"),
-            },
-            3 => match (parts[0].take(), parts[1].take(), parts[2].take()) {
-                (ExprPart::Value(left), ExprPart::Infix(ExprInfix::Assign(infix)), ExprPart::Value(right)) => {
-                    return Expr::Assign(Box::new((left.to_assignee(iter), infix, right)))
-                }
-                (ExprPart::Value(left), ExprPart::Infix(infix), ExprPart::Value(right)) => {
-                    return Expr::Infix(Box::new((left, infix, right)))
-                }
-                (
-                    ExprPart::Value(value),
-                    ExprPart::Postfix(postfix1),
-                    ExprPart::Postfix(postfix2),
-                ) => {
-                    let expr = Expr::Postfix(Box::new((value, postfix1)));
-                    return Expr::Postfix(Box::new((expr, postfix2)));
-                }
-                (ExprPart::Prefix(prefix2), ExprPart::Prefix(prefix1), ExprPart::Value(value)) => {
-                    let expr = Expr::Prefix(Box::new((prefix1, value)));
-                    return Expr::Prefix(Box::new((prefix2, expr)));
-                }
-                (ExprPart::Prefix(ExprPrefix::New(new_src)), ExprPart::Value(value), ExprPart::Postfix(ExprPostfix::Call(call_src, args))) => {
-                    let src = iter.cover(new_src, call_src);
-                    return Expr::NewCall(src, Box::new((value, args)));
-                }
-                (ExprPart::Prefix(prefix), ExprPart::Value(value), ExprPart::Postfix(postfix)) => {
-                    use std::cmp::Ordering::*;
-                    match u8::cmp(&prefix.precedence(), &postfix.precedence()) {
-                        Less => {
-                            let expr = Expr::Postfix(Box::new((value, postfix)));
-                            return Expr::Prefix(Box::new((prefix, expr)));
-                        }
-                        Equal => panic!("Nenhum operador tem a mesma precedencia de um operador postfix"),
-                        Greater => {
-                            let expr = Expr::Prefix(Box::new((prefix, value)));
-                            return Expr::Postfix(Box::new((expr, postfix)));
-                        }
-                    }
-                }
-                _ => panic!("Expr::from_parts chamado com um array de tamanho 3 inválido"),
-            },
-            _ => {}
+        if parts.is_empty() {
+            panic!("Expr::from_parts chamado com um array vazio");
+        }
+        if parts.len() == 1 {
+            if let ExprPart::Value(value) = parts[0].take() {
+                return value;
+            } else {
+                panic!("Expr::from_parts chamado com um array de tamanho 1 que continha um operador");
+            }
         }
         let mut precedence = u8::MAX;
         let mut left_index = 0;
@@ -1349,7 +1367,7 @@ impl<'a> Expr<'a> {
                 depth += 1;
             } else if let ExprPart::Infix(ExprInfix::TernaryAnswer(_)) = parts[i] {
                 if depth > 0 {
-                    depth += 1;
+                    depth -= 1;
                 } else {
                     panic!("Expr::from_parts chamado com um array inválido, tem um TernaryAnswer sem um TernaryQuestion correspondente");
                 }
@@ -1442,35 +1460,67 @@ impl<'a> Expr<'a> {
                 }
                 panic!("Expr::from_parts chamado com um array inválido, tem um TernaryQuestion sem um TernaryAnswer correspondente");
             }
-            ExprPart::Infix(ExprInfix::Assign(infix)) => {
+            ExprPart::Infix(ExprInfix::Assign(_)) => {
                 let left = Self::from_parts(iter, &mut parts[..index]);
                 let right = Self::from_parts(iter, &mut parts[index + 1..]);
-                Self::Assign(Box::new((left.to_assignee(iter), infix, right)))
+                Self::Assign(Box::new((left.to_assignee(iter), right)))
+            }
+            ExprPart::Infix(ExprInfix::CompoundAssign(infix)) => {
+                let left = Self::from_parts(iter, &mut parts[..index]);
+                let right = Self::from_parts(iter, &mut parts[index + 1..]);
+                Self::CompoundAssign(Box::new((left.to_simple_assignee(iter), infix, right)))
             }
             ExprPart::Infix(infix) => {
                 let left = Self::from_parts(iter, &mut parts[..index]);
                 let right = Self::from_parts(iter, &mut parts[index + 1..]);
                 Self::Infix(Box::new((left, infix, right)))
             }
+            ExprPart::Prefix(ExprPrefix::New(src_new)) => {
+                let value = Self::from_parts(iter, &mut parts[index + 1..]);
+                let my_value = if let Expr::Postfix(postfix) = value {
+                    if let ExprPostfix::Call(src_call, args) = postfix.1 {
+                        Self::NewCall(iter.cover(src_new, src_call), Box::new((postfix.0, args)))
+                    } else {
+                        Self::Prefix(Box::new((ExprPrefix::New(src_new), Expr::Postfix(postfix))))
+                    }
+                } else {
+                    Self::Prefix(Box::new((ExprPrefix::New(src_new), value)))
+                };
+                parts[index] = ExprPart::Value(my_value);
+                Self::from_parts(iter, &mut parts[..=index])
+            }
+            ExprPart::Prefix(ExprPrefix::PreIncrement(src)) => {
+                let value = Self::from_parts(iter, &mut parts[index + 1..]);
+                let src = iter.cover(src, value.src(iter));
+                let assignee = value.to_simple_assignee(iter);
+                parts[index] = ExprPart::Value(Self::PreIncrement(src, Box::new(assignee)));
+                Self::from_parts(iter, &mut parts[..=index])
+            }
+            ExprPart::Prefix(ExprPrefix::PreDecrement(src)) => {
+                let value = Self::from_parts(iter, &mut parts[index + 1..]);
+                let src = iter.cover(src, value.src(iter));
+                let assignee = value.to_simple_assignee(iter);
+                parts[index] = ExprPart::Value(Self::PreDecrement(src, Box::new(assignee)));
+                Self::from_parts(iter, &mut parts[..=index])
+            }
             ExprPart::Prefix(prefix) => {
                 let value = Self::from_parts(iter, &mut parts[index + 1..]);
                 parts[index] = ExprPart::Value(Self::Prefix(Box::new((prefix, value))));
                 Self::from_parts(iter, &mut parts[..=index])
             }
-            ExprPart::Postfix(ExprPostfix::Call(call_src, args)) => {
-                if let ExprPart::Prefix(ExprPrefix::New(_)) = parts[0] {
-                    let ExprPart::Prefix(ExprPrefix::New(new_src)) = parts[0].take() else {
-                        unreachable!()
-                    };
-                    let src = iter.cover(new_src, call_src);
-                    let value = Self::from_parts(iter, &mut parts[1..index]);
-                    parts[index] = ExprPart::Value(Self::NewCall(src, Box::new((value, args))));
-                    Self::from_parts(iter, &mut parts[index..])
-                } else {
-                    let value = Self::from_parts(iter, &mut parts[..index]);
-                    parts[index] = ExprPart::Value(Self::Postfix(Box::new((value, ExprPostfix::Call(call_src, args)))));
-                    Self::from_parts(iter, &mut parts[index..])
-                }
+            ExprPart::Postfix(ExprPostfix::PostIncrement(src)) => {
+                let value = Self::from_parts(iter, &mut parts[..index]);
+                let src = iter.cover(src, value.src(iter));
+                let assignee = value.to_simple_assignee(iter);
+                parts[index] = ExprPart::Value(Self::PostIncrement(src, Box::new(assignee)));
+                Self::from_parts(iter, &mut parts[index..])
+            }
+            ExprPart::Postfix(ExprPostfix::PostDecrement(src)) => {
+                let value = Self::from_parts(iter, &mut parts[..index]);
+                let src = iter.cover(src, value.src(iter));
+                let assignee = value.to_simple_assignee(iter);
+                parts[index] = ExprPart::Value(Self::PostDecrement(src, Box::new(assignee)));
+                Self::from_parts(iter, &mut parts[index..])
             }
             ExprPart::Postfix(postfix) => {
                 let value = Self::from_parts(iter, &mut parts[..index]);
@@ -1485,15 +1535,14 @@ impl<'a> Expr<'a> {
             }
         }
     }
-    /// retona um str que cobre todo o str, serve para dar erros mostrando a expressão correta
+    /// retona um str que cobre todo o expr, serve para dar erros mostrando a expressão correta
     fn src(&self, iter: &TokenIter<'a>) -> &'a src {
         match self {
-            Expr::Undefined(src)
-            | Expr::Null(src)
+            Expr::Error => "",
+            Expr::Null(src)
             | Expr::True(src)
             | Expr::False(src)
             | Expr::This(src)
-            | Expr::Parameters(src)
             | Expr::NewTarget(src)
             | Expr::Identifier(src)
             | Expr::Number(src)
@@ -1503,12 +1552,17 @@ impl<'a> Expr<'a> {
             | Expr::FunctionExpr { src, .. }
             | Expr::Array(src, _)
             | Expr::Object(src, _)
-            | Expr::NewCall(src, _) => src,
+            | Expr::NewCall(src, _)
+            | Expr::PreIncrement(src, _)
+            | Expr::PreDecrement(src, _)
+            | Expr::PostIncrement(src, _)
+            | Expr::PostDecrement(src, _) => src,
             Expr::Postfix(postfix) => iter.cover(postfix.0.src(iter), postfix.1.src()),
             Expr::Infix(infix) => iter.cover(infix.0.src(iter), infix.2.src(iter)),
             Expr::Prefix(prefix) => iter.cover(prefix.0.src(), prefix.1.src(iter)),
             Expr::Ternary(ternary) => iter.cover(ternary.0.src(iter), ternary.2.src(iter)),
-            Expr::Assign(assign) => iter.cover(assign.0.src(), assign.2.src(iter)),
+            Expr::Assign(assign) => iter.cover(assign.0.src(), assign.1.src(iter)),
+            Expr::CompoundAssign(assign) => iter.cover(assign.0.src(), assign.2.src(iter)),
             Expr::Spread(src, spread) => iter.cover(src, spread.src(iter)),
         }
     }
@@ -1548,9 +1602,34 @@ impl<'a> Expr<'a> {
             _ => {
                 iter.error_at(
                     self.src(iter),
-                    "Você não pode escrever um valor para esta expressão",
+                    "Você não pode atribuir um valor para este tipo de expressão",
                 );
                 Assignee::Identifier("")
+            }
+        }
+    }
+    // mesma coisa de to_assignee, exceto que só é permitido Assignee::Identifier, Assignee::Member e Assignee::Index
+    fn to_simple_assignee(self, iter: &mut TokenIter<'a>) -> SimpleAssignee<'a> {
+        match self {
+            Expr::Identifier(identifier) => SimpleAssignee::Identifier(identifier),
+            Expr::Postfix(postfix) if matches!(postfix.1, ExprPostfix::Member(_, _)) => {
+                let ExprPostfix::Member(src, member) = postfix.1 else {
+                    unreachable!();
+                };
+                SimpleAssignee::Member(src, postfix.0, member)
+            }
+            Expr::Postfix(postfix) if matches!(postfix.1, ExprPostfix::Index(_, _)) => {
+                let ExprPostfix::Index(src, expr) = postfix.1 else {
+                    unreachable!();
+                };
+                SimpleAssignee::Index(src, postfix.0, expr)
+            }
+            _ => {
+                iter.error_at(
+                    self.src(iter),
+                    "Você não pode atribuir um valor para este tipo de expressão",
+                );
+                SimpleAssignee::Identifier("")
             }
         }
     }
@@ -1607,7 +1686,6 @@ impl<'a> ExprPostfix<'a> {
             ExprPostfix::Call(_, _) => 17,
             ExprPostfix::Index(_, _) => 17,
             ExprPostfix::Member(_, _) => 17,
-            ExprPostfix::MemberOpt(_, _) => 17,
             ExprPostfix::PostIncrement(_) => 15,
             ExprPostfix::PostDecrement(_) => 15,
         }
@@ -1617,7 +1695,6 @@ impl<'a> ExprPostfix<'a> {
             ExprPostfix::Call(src, _)
             | ExprPostfix::Index(src, _)
             | ExprPostfix::Member(src, _)
-            | ExprPostfix::MemberOpt(src, _)
             | ExprPostfix::PostIncrement(src)
             | ExprPostfix::PostDecrement(src) => src,
         }
@@ -1634,7 +1711,7 @@ impl<'a> ExprInfix<'a> {
             ExprInfix::Subtract(_) => 11,
             ExprInfix::BitwiseLeft(_) => 10,
             ExprInfix::BitwiseRight(_) => 10,
-            ExprInfix::BitwiseLeftUnsigned(_) => 10,
+            ExprInfix::BitwiseRightUnsigned(_) => 10,
             ExprInfix::Less(_) => 9,
             ExprInfix::LessEqual(_) => 9,
             ExprInfix::Greater(_) => 9,
@@ -1654,6 +1731,7 @@ impl<'a> ExprInfix<'a> {
             ExprInfix::TernaryQuestion(_) => 2,
             ExprInfix::TernaryAnswer(_) => 2,
             ExprInfix::Assign(_) => 2,
+            ExprInfix::CompoundAssign(_) => 2,
             ExprInfix::Comma(_) => 1,
         }
     }
