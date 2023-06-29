@@ -1,5 +1,5 @@
 #![allow(unused_variables)]
-use crate::runtime::{cstring16, Number, String, Value};
+use crate::runtime::{js_string, Key, Number, String, Value};
 
 enum NumberPair {
     Integer(i64, i64),
@@ -7,7 +7,7 @@ enum NumberPair {
 }
 
 impl Value {
-    pub fn power(self, rhs: Value) -> Value {
+    pub fn power(self, rhs: Self) -> Self {
         match num_pair(&self, &rhs) {
             NumberPair::Integer(lhs, rhs) => {
                 if rhs < 0 || rhs > u32::MAX as i64 {
@@ -22,60 +22,64 @@ impl Value {
         }
         .to_value()
     }
-    pub fn increment(self) -> Value {
+    pub fn increment(self) -> Self {
         match self.to_number() {
             Number::Integer(i) => Number::Integer(i + 1),
             Number::Float(f) => Number::Float(f + 1.0),
         }
         .to_value()
     }
-    pub fn decrement(self) -> Value {
+    pub fn decrement(self) -> Self {
         match self.to_number() {
             Number::Integer(i) => Number::Integer(i - 1),
             Number::Float(f) => Number::Float(f - 1.0),
         }
         .to_value()
     }
-    pub fn type_name(self) -> Value {
+    pub fn type_name(self) -> Self {
         match self {
-            Value::Undefined => Value::String(cstring16!('u' 'n' 'd' 'e' 'f' 'i' 'n' 'e' 'd')),
-            Value::Null => Value::String(cstring16!('o' 'b' 'j' 'e' 'c' 't')),
-            Value::Boolean(_) => Value::String(cstring16!('b' 'o' 'o' 'l' 'e' 'a' 'n')),
-            Value::Integer(_) => Value::String(cstring16!('n' 'u' 'm' 'b' 'e' 'r')),
-            Value::Float(_) => Value::String(cstring16!('f' 'l' 'o' 'a' 't')),
-            Value::String(_) => Value::String(cstring16!('s' 't' 'r' 'i' 'n' 'g')),
-            Value::Object(object) if object.is_function() => {
-                Value::String(cstring16!('f' 'u' 'n' 'c' 't' 'i' 'o' 'n'))
+            Self::Undefined => Self::String(js_string!("undefined")),
+            Self::Null => Self::String(js_string!("object")),
+            Self::Boolean(_) => Self::String(js_string!("boolean")),
+            Self::Integer(_) => Self::String(js_string!("number")),
+            Self::Float(_) => Self::String(js_string!("float")),
+            Self::String(_) => Self::String(js_string!("string")),
+            Self::Object(object) if object.is_function() => {
+                Self::String(js_string!("function"))
             }
-            Value::Object(_) => Value::String(cstring16!('o' 'b' 'j' 'e' 'c' 't')),
+            Self::Object(_) => Self::String(js_string!("object")),
+            Self::Symbol(_, _) => Self::String(js_string!("symbol")),
         }
     }
-    pub fn bitwise_not(self) -> Value {
-        Value::Integer((!self.to_integer() as i32) as i64)
+    pub fn bitwise_not(self) -> Self {
+        Self::Integer((!self.to_integer() as i32) as i64)
     }
-    pub fn bitwise_right_unsigned(self, rhs: Value) -> Value {
+    pub fn bitwise_right_unsigned(self, rhs: Self) -> Self {
         let (lhs, rhs) = int_pair(self, rhs);
         let shift = (rhs & 0x1F) as u32;
-        Value::Integer((lhs as u32).rotate_right(shift) as i64)
+        Self::Integer((lhs as u32).rotate_right(shift) as i64)
     }
-    pub fn sloppy_equals(self, rhs: Value) -> bool {
+    pub fn sloppy_equals(self, rhs: Self) -> bool {
         match (self, rhs) {
-            (Value::String(lhs), Value::String(rhs)) => lhs == rhs,
-            (lhs, Value::String(rhs)) => lhs.to_string() == rhs,
-            (Value::String(lhs), rhs) => lhs == rhs.to_string(),
+            (Self::Symbol(0, lhs), Self::Symbol(0, rhs)) => lhs == rhs,
+            (Self::Symbol(lhs, _), Self::Symbol(rhs, _)) => lhs == rhs,
+            (Self::Symbol(_, _), _) | (_, Self::Symbol(_, _)) => false,
+            (Self::String(lhs), Self::String(rhs)) => lhs == rhs,
+            (lhs, Self::String(rhs)) => lhs.to_string() == rhs,
+            (Self::String(lhs), rhs) => lhs == rhs.to_string(),
             (lhs, rhs) => match num_pair(&lhs, &rhs) {
                 NumberPair::Integer(lhs, rhs) => lhs == rhs,
                 NumberPair::Float(lhs, rhs) => lhs == rhs,
             },
         }
     }
-    pub fn instanceof(self, rhs: Value) -> bool {
-        if let (Value::Object(mut object), Value::Object(constructor)) = (self, rhs) {
+    pub fn instanceof(self, rhs: Self) -> bool {
+        if let (Self::Object(mut object), Self::Object(constructor)) = (self, rhs) {
             if !constructor.is_function() {
                 todo!("error: não é um construtor");
             }
-            const PROTOTYPE_KEY: String = cstring16!('p' 'r' 'o' 't' 'o' 't' 'y' 'p' 'e');
-            let Value::Object(constructor_prototype) = constructor.property(&PROTOTYPE_KEY) else {
+            const PROTOTYPE_KEY: Key = Key::String(js_string!("prototype"));
+            let Some(Self::Object(constructor_prototype)) = constructor.property(PROTOTYPE_KEY.clone()) else {
                 return false;
             };
             loop {
@@ -93,58 +97,72 @@ impl Value {
     }
     pub fn to_string(self) -> String {
         match self {
-            Value::Undefined => cstring16!('u' 'n' 'd' 'e' 'f' 'i' 'n' 'e' 'd'),
-            Value::Null => cstring16!('n' 'u' 'l' 'l'),
-            Value::Boolean(true) => cstring16!('t' 'r' 'u' 'e'),
-            Value::Boolean(false) => cstring16!('f' 'a' 'l' 's' 'e'),
-            Value::Integer(integer) => String::Owned(integer.to_string().encode_utf16().collect()),
-            Value::Float(float) => String::Owned(float.to_string().encode_utf16().collect()),
-            Value::String(string) => string,
-            Value::Object(object) => {
+            Self::Undefined => js_string!("undefined"),
+            Self::Null => js_string!("null"),
+            Self::Boolean(true) => js_string!("true"),
+            Self::Boolean(false) => js_string!("false"),
+            Self::Integer(integer) => String::from_integer(integer),
+            Self::Float(float) => String::from_float(float),
+            Self::String(string) => string,
+            Self::Object(object) => {
                 //todo!("Object to_string");
-                cstring16!('o' 'b' 'j' 'e' 'c' 't')
-            },
+                js_string!("object")
+            }
+            Self::Symbol(_, name) => {
+                if name.len() == 0 {
+                    js_string!("Symbol()")
+                } else {
+                    let mut vec = Vec::with_capacity(8 + name.len());
+                    vec.extend("Symbol(".bytes().map(|x| x as u16));
+                    vec.extend_from_slice(name.as_slice());
+                    vec.push(')' as u16);
+                    String::Owned(vec)
+                }
+            }
         }
     }
     pub fn to_number(&self) -> Number {
         match self {
-            Value::Undefined => Number::Float(f64::NAN),
-            Value::Null => Number::Float(f64::NAN),
-            Value::Boolean(true) => Number::Integer(1),
-            Value::Boolean(false) => Number::Integer(0),
-            Value::Integer(i) => Number::Integer(*i),
-            Value::Float(f) => Number::Float(*f),
-            Value::String(string) => string.to_number(),
-            Value::Object(_) => {
+            Self::Undefined => Number::Float(f64::NAN),
+            Self::Null => Number::Integer(0),
+            Self::Boolean(true) => Number::Integer(1),
+            Self::Boolean(false) => Number::Integer(0),
+            Self::Integer(i) => Number::Integer(*i),
+            Self::Float(f) => Number::Float(*f),
+            Self::String(string) => string.to_number(),
+            Self::Object(_) => {
                 //todo!("Object to_number"),
                 Number::Float(f64::NAN)
             }
+            Self::Symbol(_, _) => todo!("erro: não é possível converter symbol para numero"),
         }
     }
     pub fn to_integer(self) -> i64 {
         match self {
-            Value::Undefined => 0,
-            Value::Null => 0,
-            Value::Boolean(true) => 1,
-            Value::Boolean(false) => 0,
-            Value::Integer(i) => i,
-            Value::Float(f) => f as i64,
-            Value::String(string) => string.to_number().to_int(),
-            Value::Object(_) => {
+            Self::Undefined => 0,
+            Self::Null => 0,
+            Self::Boolean(true) => 1,
+            Self::Boolean(false) => 0,
+            Self::Integer(i) => i,
+            Self::Float(f) => f as i64,
+            Self::String(string) => string.to_number().to_int(),
+            Self::Object(_) => {
                 //todo!("Object to_number"),
                 0
             }
+            Self::Symbol(_, _) => todo!("erro: não é possível converter symbol para numero"),
         }
     }
     pub fn to_boolean(&self) -> bool {
         match self {
-            Value::Undefined => false,
-            Value::Null => false,
-            Value::Boolean(boolean) => *boolean,
-            Value::Integer(integer) => *integer != 0,
-            Value::Float(float) => *float != 0.0 && !float.is_nan(),
-            Value::String(string) => string.len() != 0,
-            Value::Object(_) => true,
+            Self::Undefined => false,
+            Self::Null => false,
+            Self::Boolean(boolean) => *boolean,
+            Self::Integer(integer) => *integer != 0,
+            Self::Float(float) => *float != 0.0 && !float.is_nan(),
+            Self::String(string) => string.len() != 0,
+            Self::Object(_) => true,
+            Self::Symbol(_, _) => true,
         }
     }
 }
@@ -168,9 +186,9 @@ impl std::ops::Add for Value {
     type Output = Self;
     fn add(self, rhs: Self) -> Self::Output {
         match (self, rhs) {
-            (Value::String(lhs), Value::String(rhs)) => Value::String(lhs + rhs),
-            (lhs, Value::String(rhs)) => Value::String(lhs.to_string() + rhs),
-            (Value::String(lhs), rhs) => Value::String(lhs + rhs.to_string()),
+            (Self::String(lhs), Self::String(rhs)) => Self::String(lhs + rhs),
+            (lhs, Self::String(rhs)) => Self::String(lhs.to_string() + rhs),
+            (Self::String(lhs), rhs) => Self::String(lhs + rhs.to_string()),
             (lhs, rhs) => num_op(lhs, rhs, i64::checked_add, std::ops::Add::add),
         }
     }
@@ -246,6 +264,9 @@ impl PartialEq for Value {
             (Self::Float(lhs), Self::Float(rhs)) => lhs == rhs,
             (Self::String(lhs), Self::String(rhs)) => lhs == rhs,
             (Self::Object(lhs), Self::Object(rhs)) => lhs == rhs,
+            (Self::Symbol(0, lhs), Self::Symbol(0, rhs)) => lhs == rhs,
+            (Self::Symbol(lhs, _), Self::Symbol(rhs, _)) => lhs == rhs,
+            (Self::Symbol(_, _), _) | (_, Self::Symbol(_, _)) => false,
             _ => false,
         }
     }
@@ -253,9 +274,12 @@ impl PartialEq for Value {
 impl PartialOrd for Value {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (self, other) {
-            (Value::String(lhs), Value::String(rhs)) => PartialOrd::partial_cmp(lhs, rhs),
-            (lhs, Value::String(rhs)) => PartialOrd::partial_cmp(&lhs.clone().to_string(), rhs),
-            (Value::String(lhs), rhs) => PartialOrd::partial_cmp(lhs, &rhs.clone().to_string()),
+            (Self::Symbol(0, lhs), Self::Symbol(0, rhs)) if lhs == rhs => Some(std::cmp::Ordering::Equal),
+            (Self::Symbol(lhs, _), Self::Symbol(rhs, _)) if lhs == rhs => Some(std::cmp::Ordering::Equal),
+            (Self::Symbol(_, _), _) | (_, Self::Symbol(_, _)) => None,
+            (Self::String(lhs), Self::String(rhs)) => PartialOrd::partial_cmp(lhs, rhs),
+            (lhs, Self::String(rhs)) => PartialOrd::partial_cmp(&lhs.clone().to_string(), rhs),
+            (Self::String(lhs), rhs) => PartialOrd::partial_cmp(lhs, &rhs.clone().to_string()),
             (lhs, rhs) => match num_pair(lhs, rhs) {
                 NumberPair::Integer(lhs, rhs) => PartialOrd::partial_cmp(&lhs, &rhs),
                 NumberPair::Float(lhs, rhs) => PartialOrd::partial_cmp(&lhs, &rhs),

@@ -521,6 +521,14 @@ fn compile_expression<'a>(wip: &mut Wip<'a>, expr: &Expr<'a>) {
             DeclLocation::Global if *name == "undefined" => {
                 wip.write_inst(instruction::UNDEFINED);
             }
+            DeclLocation::Global if *name == "Infinity" => {
+                wip.write_inst(instruction::FLOAT);
+                wip.write_f64(f64::INFINITY);
+            }
+            DeclLocation::Global if *name == "NaN" => {
+                wip.write_inst(instruction::FLOAT);
+                wip.write_f64(f64::NAN);
+            }
             DeclLocation::Global => {
                 wip.write_inst(instruction::GLOBAL_MEMBER);
                 wip.write_str(name);
@@ -1104,6 +1112,7 @@ fn compile_expression<'a>(wip: &mut Wip<'a>, expr: &Expr<'a>) {
         }
         Expr::Spread(_, expr) => {
             compile_expression(wip, expr);
+            wip.write_inst(instruction::ITERATOR);
             wip.write_inst(instruction::SPREAD);
         }
     }
@@ -1217,6 +1226,8 @@ fn compile_function<'a>(
 fn compile_number<'a>(wip: &mut Wip<'a>, number: &'a str) {
     match parse_number(number) {
         ParsedNumber::Integer(value) => match value {
+            0 => wip.write_inst(instruction::ZERO),
+            1 => wip.write_inst(instruction::ONE),
             -0x80..=0x7F => {
                 wip.write_inst(instruction::INTEGER_8);
                 wip.write_i8(value as i8);
@@ -1488,7 +1499,17 @@ impl<'a> Wip<'a> {
                             }
                         } else if frame_index == u32::MAX {
                             // variável foi encontrada nas globais declaradas (static)
-                            DeclLocation::Static(index as u32, item.clone())
+                            let mut frame_location = 0;
+                            for item in self.stack[..index].iter().rev() {
+                                match item {
+                                    Declaration::Var(_)
+                                    | Declaration::Let(_)
+                                    | Declaration::Const(_) => frame_location += 1,
+                                    Declaration::Function(_, _) => {}
+                                    Declaration::Frame { .. } => panic!("era para index já estar além de todos os Declaration::Frame"),
+                                }
+                            }
+                            DeclLocation::Static(frame_location, item.clone())
                         } else {
                             // variável foi encontrada no frame de outra função
                             DeclLocation::Capture

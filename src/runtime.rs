@@ -1,8 +1,22 @@
-use std::{cell::RefCell, collections::HashMap, fmt::Debug, hash::Hash, rc::Rc};
+use std::{
+    cell::{Ref, RefCell, RefMut},
+    collections::HashMap,
+    fmt::{Debug, Display},
+    hash::Hash,
+    rc::Rc,
+    sync::atomic,
+};
 
 use crate::utils::{self, MAX_SAFE_INTEGER, MIN_SAFE_INTEGER};
 
-const PROTOTYPE_KEY: String = cstring16!('p' 'r' 'o' 't' 'o' 't' 'y' 'p' 'e');
+use native::Native;
+
+#[path = "native.rs"]
+mod native;
+#[path = "operator.rs"]
+mod operator;
+
+const PROTOTYPE_KEY: Key = Key::String(js_string!("prototype"));
 
 /// representa um programa compilado
 #[derive(Clone)]
@@ -103,14 +117,18 @@ instruction! {
     TRUE;
     /// () push false
     FALSE;
-    /// (%i) push integer
+    /// (%i64) push integer
     INTEGER_64 %i64;
-    /// (%i) push integer
+    /// (%i32) push integer
     INTEGER_32 %i32;
-    /// (%i) push integer
+    /// (%i16) push integer
     INTEGER_16 %i16;
-    /// (%i) push integer
+    /// (%i8) push integer
     INTEGER_8 %i8;
+    /// () push integer 0
+    ZERO;
+    /// () push integer 1
+    ONE;
     /// (%f) push float
     FLOAT %f;
     /// (%s) push string
@@ -143,7 +161,7 @@ instruction! {
     PUSH %m;
     /// () pop value
     POP;
-    /// (%n) pop %m values from stack
+    /// (%n) pop %m values from state
     POP_MANY %n;
     /// (%n) pop value, pop %n values from stack, push value
     POP_RETAIN %n;
@@ -172,7 +190,13 @@ instruction! {
     /// () -> pop value, stop the program
     QUIT;
 
-    /// () pop value, turn into an iterator, push all iterated values on the stack, add to the spread register the amount of iterated values
+    /// () pop this, call this[Symbol.iterator], push result
+    ITERATOR;
+
+    /// (%j) pop iterator, call iterator.next, if result.done is falsy then push result.value, else jump to %j
+    ITERATE %j;
+
+    /// () pop iterator, call iterator.next, if result.done is falsy then decrement pc, push result.value, push iterator
     SPREAD;
 
     /// (%m) stack(%m) = stack(0)
@@ -307,21 +331,21 @@ pub struct State {
     prog: ProgReader,
     /// a pilha, ela é compartilhada entre as várias chamadas de função
     stack: Stack,
-    /// a memoria do programa, criada externamente, e movida para cá, e quando o programa termina, ela é retornada
-    memory: Memory,
 }
 
 /// representa a memoria da máquina virtual, isso é todo o estado que existe depois que ela termina de executar
 #[derive(Debug, Clone)]
 pub struct Memory {
+    symbol_generator: Rc<atomic::AtomicI64>,
     /// onde as variávies globais são guardadas
-    pub global: Object,
-    pub boolean_prototype: Object,
-    pub string_prototype: Object,
-    pub number_prototype: Object,
-    pub object_prototype: Object,
-    pub function_prototype: Object,
-    pub array_prototype: Object,
+    global: Object,
+    boolean_prototype: Object,
+    string_prototype: Object,
+    number_prototype: Object,
+    object_prototype: Object,
+    function_prototype: Object,
+    array_prototype: Object,
+    symbol_prototype: Object,
 }
 
 #[derive(Debug, Clone)]
@@ -346,6 +370,7 @@ enum Slot {
     Frame {
         return_location: ProgReader,
         frame: Frame,
+        ty: FrameType,
     },
 }
 
@@ -355,8 +380,16 @@ struct Frame {
     frame: usize,
     argc: u32,
     spread: u32,
-    this: Object,
+    this: Option<Object>,
     new_target: Option<Object>,
+}
+
+/// o tipo de frame, indica o que fazer ao retornar deste frame
+#[derive(Debug, Clone)]
+enum FrameType {
+    Normal,
+    Spread(Box<Value>),
+    Iterate(Box<(Value, ProgReader)>),
 }
 
 /// representa um valor do javascript
@@ -369,6 +402,7 @@ pub enum Value {
     Float(f64),
     String(String),
     Object(Object),
+    Symbol(i64, String),
 }
 
 /// mesma coisa que um value, mas simplificado para os dois tipos numericos
@@ -385,12 +419,18 @@ pub enum String {
     Static(&'static [u16]),
 }
 
-macro_rules! cstring16 {
-    ($($char:literal)*) => {
-        String::Static(&[$($char as u16,)*])
+#[derive(Clone)]
+pub struct Symbol {
+    pub id: i64,
+    pub name: String,
+}
+
+macro_rules! js_string {
+    ($str:literal) => {
+        crate::runtime::String::Static(&utf16_lit::utf16!($str))
     };
 }
-pub(crate) use cstring16;
+pub(crate) use js_string;
 
 /// uma referência compartilhada a um Dict
 #[derive(Clone)]
@@ -404,7 +444,10 @@ pub struct Dict {
     ///
     /// se for Soul::Function, o typeof disso é function
     soul: Soul,
-    dict: HashMap<String, Value>,
+    /// as propiedades deste objeto
+    own: HashMap<String, Value>,
+    /// as propiedades, deste objeto, definidas com symbols
+    sym: HashMap<Symbol, Value>,
     /// esse vec é uma otimização
     ///
     /// quando for obter um membro de dict, e esse membro for um numero sem sinal inteiro
@@ -419,6 +462,14 @@ pub struct Dict {
     prototype: Option<Object>,
 }
 
+/// uma string, index, ou um simbolo, todos os valores que podem ser usados como chaves de um objeto
+#[derive(Clone)]
+pub enum Key {
+    Index(usize),
+    String(String),
+    Symbol(i64, String),
+}
+
 /// o que o objecto realmente é, guarda informações adicionais sobre o objeto
 #[derive(Clone)]
 enum Soul {
@@ -428,17 +479,20 @@ enum Soul {
     Integer(i64),
     Float(f64),
     String(String),
+    Symbol(i64, String),
 }
 
 #[derive(Debug, Clone)]
 enum Function {
+    Native(Native),
     /// Chamada de um programa, o ProgReader fica no começo da função
     FunctionCall(ProgReader),
 }
 
 pub fn execute(program: Rc<Program>) -> Value {
-    let mut state = State::new(program, Memory::new());
-    state.run()
+    let memory = Memory::new();
+    let mut state = State::new(program);
+    state.run(&memory)
 }
 
 impl Program {
@@ -574,47 +628,62 @@ impl Debug for Program {
 
 impl State {
     /// cria um novo estado, quando for executado, começará a executar o program
-    pub fn new(program: Rc<Program>, memory: Memory) -> Self {
+    pub fn new(program: Rc<Program>) -> Self {
         State {
             prog: ProgReader::new(program),
-            stack: Stack::new(memory.global.clone()),
-            memory,
+            stack: Stack::new(),
         }
     }
     /// executa a máquina virtual até que ela termine, e retorna o valor que ela retornou
-    pub fn run(&mut self) -> Value {
-        let this = self.stack.frame.this.clone();
-        let mut prog = self.prog.clone();
-        let mut stack = std::mem::replace(&mut self.stack, Stack::new(this));
-        let memory = self.memory.clone();
-        let value = loop {
-            if let Some(value) = execute_step(&mut prog, &mut stack, &memory) {
-                break value;
+    pub fn run(&mut self, memory: &Memory) -> Value {
+        loop {
+            if let Some(value) = execute_step(self, memory) {
+                return value;
             }
-        };
-        self.prog = prog;
-        self.stack = stack;
-        value
-    }
-    /// retorna a memoria do programa
-    #[allow(dead_code)]
-    pub fn to_memory(self) -> Memory {
-        self.memory
+        }
     }
 }
 
 impl Memory {
     pub fn new() -> Self {
         let object_prototype = Object::without_prototype();
-        Self {
+        let memory = Self {
+            symbol_generator: Rc::new(atomic::AtomicI64::new(1)),
             global: Object::new(object_prototype.clone()),
             boolean_prototype: Object::new(object_prototype.clone()),
             string_prototype: Object::new(object_prototype.clone()),
             number_prototype: Object::new(object_prototype.clone()),
             function_prototype: Object::new(object_prototype.clone()),
             array_prototype: Object::new(object_prototype.clone()),
+            symbol_prototype: Object::new(object_prototype.clone()),
             object_prototype,
-        }
+        };
+        Native::add_native_objects(&memory);
+        memory
+    }
+    /// retorna o objeto global
+    pub fn global(&self) -> Object {
+        self.global.clone()
+    }
+    /// retorna números crescentes a partir de 1
+    ///
+    /// serve para criar indentificadores dinâmicos para Symbol
+    pub fn generate_symbol_id(&mut self) -> i64 {
+        self.symbol_generator
+            .fetch_add(1, atomic::Ordering::Relaxed)
+    }
+    /// cria um novo objecto limpo, usando o prototype de Object configurado nesta Memory
+    pub fn obj(&self) -> Object {
+        Object::new(self.object_prototype.clone())
+    }
+    pub fn arr(&self, items: impl Iterator<Item = Option<Value>>) -> Object {
+        let arr = Object::new(self.array_prototype.clone());
+        let mut dict = arr.borrow_mut();
+        dict.vec.extend(items);
+        let length = dict.vec.len();
+        dict.assign_property(js_string!("length"), length);
+        drop(dict);
+        arr
     }
 }
 
@@ -661,10 +730,10 @@ impl ProgReader {
 }
 
 impl Stack {
-    fn new(this: Object) -> Self {
+    fn new() -> Self {
         Self {
             stack: Vec::new(),
-            frame: Frame::new(this),
+            frame: Frame::new(),
         }
     }
     fn absolute(&self, index: u32) -> &Value {
@@ -780,8 +849,9 @@ impl Stack {
         &mut self,
         return_location: ProgReader,
         argc: u32,
-        this: Object,
+        this: Option<Object>,
         new_target: Option<Object>,
+        ty: FrameType,
     ) {
         let new_frame = Frame {
             frame: self.len() + 1,
@@ -793,23 +863,64 @@ impl Stack {
         self.stack.push(Slot::Frame {
             return_location,
             frame: std::mem::replace(&mut self.frame, new_frame),
+            ty,
         });
     }
-    fn pop_frame(&mut self, return_value: Value) -> ProgReader {
+    fn pop_frame(&mut self, return_value: Value, memory: &Memory) -> ProgReader {
         match self.stack.pop() {
             Some(Slot::Frame {
                 return_location,
                 frame,
-            }) => {
-                let old_frame = std::mem::replace(&mut self.frame, frame);
-                self.pop_many(old_frame.argc);
-                if old_frame.new_target.is_some() {
-                    self.push(Value::Object(old_frame.this));
-                } else {
-                    self.push(return_value);
+                ty,
+            }) => match ty {
+                FrameType::Normal => {
+                    let old_frame = std::mem::replace(&mut self.frame, frame);
+                    self.pop_many(old_frame.argc);
+                    if old_frame.new_target.is_some() {
+                        self.push(Value::Object(old_frame.this.expect("deve ser impossível que em um frame new_target seja Some, mas this seja None")));
+                    } else {
+                        self.push(return_value);
+                    }
+                    return return_location;
                 }
-                return return_location;
-            }
+                FrameType::Spread(this) => {
+                    let old_frame = std::mem::replace(&mut self.frame, frame);
+                    self.pop_many(old_frame.argc);
+                    if !return_value
+                        .property(js_string!("done"), memory)
+                        .unwrap_or(Value::Undefined)
+                        .to_boolean()
+                    {
+                        let value = return_value
+                            .property(js_string!("value"), memory)
+                            .unwrap_or(Value::Undefined);
+                        self.push(value);
+                        self.push(*this);
+                        self.frame.spread += 1;
+                        let mut return_location = return_location;
+                        return_location.pc -= 1;
+                        return return_location;
+                    }
+                    return return_location;
+                }
+                FrameType::Iterate(iterate) => {
+                    let old_frame = std::mem::replace(&mut self.frame, frame);
+                    self.pop_many(old_frame.argc);
+                    if !return_value
+                        .property(js_string!("done"), memory)
+                        .unwrap_or(Value::Undefined)
+                        .to_boolean()
+                    {
+                        let value = return_value
+                            .property(js_string!("value"), memory)
+                            .unwrap_or(Value::Undefined);
+                        self.push(value);
+                    } else {
+                        return iterate.1;
+                    }
+                    return return_location;
+                }
+            },
             _ => panic!("Stack::pop_frame foi chamado sem haver um Slot::Frame no topo da pilha"),
         }
     }
@@ -844,12 +955,12 @@ impl Stack {
 }
 
 impl Frame {
-    fn new(this: Object) -> Self {
+    fn new() -> Self {
         Self {
             frame: 0,
             argc: 0,
             spread: 0,
-            this,
+            this: None,
             new_target: None,
         }
     }
@@ -859,26 +970,27 @@ impl Value {
     /// é preciso memory aqui, pois pode acontecer de obtermos um property para um primitivo
     ///
     /// nesse caso precisaríamos obter o prototype dele
-    pub fn property(&self, key: &String, memory: &Memory) -> Value {
+    pub fn property(&self, key: impl Into<Key>, memory: &Memory) -> Option<Value> {
         match self {
-            Value::Undefined => Value::Undefined,
-            Value::Null => Value::Undefined,
-            Value::Boolean(_) => memory.boolean_prototype.0.borrow().property(key),
-            Value::Integer(_) => memory.number_prototype.0.borrow().property(key),
-            Value::Float(_) => memory.number_prototype.0.borrow().property(key),
-            Value::String(_) => memory.string_prototype.0.borrow().property(key),
+            Value::Undefined => todo!("erro: não é possivel ler propiedades de undefined"),
+            Value::Null => todo!("erro: não é possivel ler propiedades de null"),
+            Value::Boolean(_) => memory.boolean_prototype.property(key),
+            Value::Integer(_) => memory.number_prototype.property(key),
+            Value::Float(_) => memory.number_prototype.property(key),
+            Value::String(_) => memory.string_prototype.property(key),
             Value::Object(object) => object.property(key),
+            Value::Symbol(_, _) => memory.symbol_prototype.property(key),
         }
     }
     #[allow(dead_code)]
-    pub fn own_property(&self, key: &String) -> Option<Value> {
+    pub fn own_property(&self, key: impl Into<Key>) -> Option<Value> {
         if let Value::Object(object) = self {
             object.own_property(key)
         } else {
             None
         }
     }
-    pub fn assign_property(&self, key: String, value: Value) -> bool {
+    pub fn assign_property(&self, key: impl Into<Key>, value: Value) -> bool {
         if let Value::Object(object) = self {
             object.assign_property(key, value);
             true
@@ -886,7 +998,7 @@ impl Value {
             false
         }
     }
-    pub fn delete_property(&self, key: &String) -> bool {
+    pub fn delete_property(&self, key: impl Into<Key>) -> bool {
         if let Value::Object(object) = self {
             object.delete_property(key);
             true
@@ -903,6 +1015,7 @@ impl Value {
             Value::Float(float) => Some(Object::from_soul(Soul::Float(float), memory)),
             Value::String(string) => Some(Object::from_soul(Soul::String(string), memory)),
             Value::Object(object) => Some(object),
+            Value::Symbol(id, name) => Some(Object::from_soul(Soul::Symbol(id, name), memory)),
         }
     }
     fn to_function(&self) -> Option<Function> {
@@ -913,16 +1026,131 @@ impl Value {
         }
         None
     }
-    pub fn is_defined(&self) -> bool {
+    fn to_key(self) -> Key {
         match self {
-            Value::Undefined => false,
-            Value::Null => false,
-            Value::Boolean(_) => true,
-            Value::Integer(_) => true,
-            Value::Float(_) => true,
-            Value::String(_) => true,
-            Value::Object(_) => true,
+            Value::Integer(i) if i >= 0 => Key::Index(i as usize),
+            Value::Float(f) if f.fract() == 0.0 && (0..=MAX_SAFE_INTEGER).contains(&(f as i64)) => {
+                Key::Index(f as usize)
+            }
+            Value::String(string) => Key::String(string),
+            Value::Symbol(id, name) => Key::Symbol(id, name),
+            value => Key::String(value.to_string()),
         }
+    }
+    pub fn is_defined(&self) -> bool {
+        !matches!(self, Value::Undefined | Value::Null)
+    }
+}
+
+impl From<u8> for Value {
+    fn from(value: u8) -> Self {
+        Value::Integer(value as i64)
+    }
+}
+
+impl From<u16> for Value {
+    fn from(value: u16) -> Self {
+        Value::Integer(value as i64)
+    }
+}
+
+impl From<u32> for Value {
+    fn from(value: u32) -> Self {
+        Value::Integer(value as i64)
+    }
+}
+
+impl From<u64> for Value {
+    fn from(value: u64) -> Self {
+        if value <= MAX_SAFE_INTEGER as u64 {
+            Value::Integer(value as i64)
+        } else {
+            Value::Float(value as f64)
+        }
+    }
+}
+
+impl From<usize> for Value {
+    fn from(value: usize) -> Self {
+        if value <= MAX_SAFE_INTEGER as usize {
+            Value::Integer(value as i64)
+        } else {
+            Value::Float(value as f64)
+        }
+    }
+}
+
+impl From<i8> for Value {
+    fn from(value: i8) -> Self {
+        Value::Integer(value as i64)
+    }
+}
+
+impl From<i16> for Value {
+    fn from(value: i16) -> Self {
+        Value::Integer(value as i64)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(value: i32) -> Self {
+        Value::Integer(value as i64)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(value: i64) -> Self {
+        if value >= MIN_SAFE_INTEGER && value <= MAX_SAFE_INTEGER {
+            Value::Integer(value)
+        } else {
+            Value::Float(value as f64)
+        }
+    }
+}
+
+impl From<isize> for Value {
+    fn from(value: isize) -> Self {
+        if value >= MIN_SAFE_INTEGER as isize && value <= MAX_SAFE_INTEGER as isize {
+            Value::Integer(value as i64)
+        } else {
+            Value::Float(value as f64)
+        }
+    }
+}
+
+impl From<f32> for Value {
+    fn from(value: f32) -> Self {
+        Value::Float(value as f64)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(value: f64) -> Self {
+        Value::Float(value)
+    }
+}
+
+impl From<bool> for Value {
+    fn from(value: bool) -> Self {
+        Value::Boolean(value)
+    }
+}
+
+impl From<String> for Value {
+    fn from(value: String) -> Self {
+        Value::String(value)
+    }
+}
+
+impl From<Object> for Value {
+    fn from(value: Object) -> Self {
+        Value::Object(value)
+    }
+}
+
+impl From<Symbol> for Value {
+    fn from(value: Symbol) -> Self {
+        Value::Symbol(value.id, value.name)
     }
 }
 
@@ -966,6 +1194,23 @@ impl Debug for Value {
             Self::Float(val) => write!(f, "{}", val),
             Self::String(val) => write!(f, "{:#?}", val),
             Self::Object(val) => write!(f, "{:#?}", val),
+            Self::Symbol(_, name) => write!(f, "Symbol({:#?})", name),
+        }
+    }
+}
+
+impl Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Undefined => write!(f, "undefined"),
+            Self::Null => write!(f, "null"),
+            Self::Boolean(true) => write!(f, "true"),
+            Self::Boolean(false) => write!(f, "false"),
+            Self::Integer(val) => write!(f, "{}", val),
+            Self::Float(val) => write!(f, "{}", val),
+            Self::String(val) => write!(f, "{}", val),
+            Self::Object(val) => write!(f, "{:#?}", val),
+            Self::Symbol(_, name) => write!(f, "Symbol({:#?})", name),
         }
     }
 }
@@ -1058,12 +1303,18 @@ impl String {
         temp.extend(slice.iter().map(|x| *x as u8 as char));
         Number::Float(temp.parse().unwrap_or(f64::NAN))
     }
+    pub fn from_integer(i: i64) -> Self {
+        Self::Owned(i.to_string().encode_utf16().collect())
+    }
+    pub fn from_float(f: f64) -> Self {
+        Self::Owned(f.to_string().encode_utf16().collect())
+    }
 
-    /// tenta converter essa string em um index, menor que excluding_max
+    /// tenta converter essa string em um index, menor que max
     ///
     /// ela tem de ser um número simples, sem zeros no começo (exceto o própio número zero), composto completamente por dígitos ascii
-    fn try_into_index(&self, excluding_max: usize) -> Option<usize> {
-        if excluding_max == 0 {
+    fn try_into_index(&self, max: usize) -> Option<usize> {
+        if max == 0 {
             return None;
         }
         let slice = self.as_slice();
@@ -1077,7 +1328,7 @@ impl String {
                 if *digit >= b'0' as u16 && *digit <= b'9' as u16 {
                     acc = acc.checked_mul(10)?;
                     acc = acc.checked_add((*digit - b'0' as u16) as usize)?;
-                    if acc >= excluding_max {
+                    if acc >= max {
                         return None;
                     }
                 } else {
@@ -1088,6 +1339,12 @@ impl String {
         } else {
             None
         }
+    }
+}
+
+impl From<&'static [u16]> for String {
+    fn from(value: &'static [u16]) -> Self {
+        String::Static(value)
     }
 }
 
@@ -1129,6 +1386,12 @@ impl Debug for String {
     }
 }
 
+impl Display for String {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&std::string::String::from_utf16_lossy(self.as_slice()))
+    }
+}
+
 impl PartialOrd for String {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -1148,25 +1411,25 @@ impl Object {
         Self(Rc::new(RefCell::new(Dict::new(None))))
     }
     pub fn prototype(&self) -> Option<Object> {
-        self.0.borrow().prototype.clone()
+        self.borrow().prototype.clone()
     }
-    pub fn property(&self, key: &String) -> Value {
-        self.0.borrow().property(key)
+    pub fn property(&self, key: impl Into<Key>) -> Option<Value> {
+        self.borrow().property(key)
     }
-    pub fn own_property(&self, key: &String) -> Option<Value> {
-        self.0.borrow().own_property(key)
+    pub fn own_property(&self, key: impl Into<Key>) -> Option<Value> {
+        self.borrow().own_property(key)
     }
-    pub fn assign_property(&self, key: String, value: Value) {
-        self.0.borrow_mut().assign_property(key, value);
+    pub fn assign_property(&self, key: impl Into<Key>, value: impl Into<Value>) {
+        self.borrow_mut().assign_property(key, value);
     }
-    pub fn delete_property(&self, key: &String) {
-        self.0.borrow_mut().delete_property(key);
+    pub fn delete_property(&self, key: impl Into<Key>) -> bool {
+        self.borrow_mut().delete_property(key)
     }
     pub fn is_function(&self) -> bool {
-        matches!(self.0.borrow().soul, Soul::Function(_))
+        matches!(self.borrow().soul, Soul::Function(_))
     }
     fn to_function(&self) -> Option<Function> {
-        if let Soul::Function(function) = &self.0.borrow().soul {
+        if let Soul::Function(function) = &self.borrow().soul {
             Some(function.clone())
         } else {
             None
@@ -1174,6 +1437,12 @@ impl Object {
     }
     fn from_soul(soul: Soul, memory: &Memory) -> Self {
         Dict::from_soul(soul, memory).to_object()
+    }
+    fn borrow<'a>(&'a self) -> Ref<'a, Dict> {
+        self.0.borrow()
+    }
+    fn borrow_mut<'a>(&'a self) -> RefMut<'a, Dict> {
+        self.0.borrow_mut()
     }
 }
 
@@ -1186,8 +1455,36 @@ impl Eq for Object {}
 
 impl Debug for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // TODO: write a good debug function
-        (&*self.0.borrow()).fmt(f)
+        (&*self.borrow()).fmt(f)
+    }
+}
+
+impl Hash for Symbol {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        if self.id != 0 {
+            self.id.hash(state);
+        } else {
+            self.name.hash(state);
+        }
+    }
+}
+
+impl PartialEq for Symbol {
+    fn eq(&self, other: &Self) -> bool {
+        if self.id != other.id {
+            false
+        } else if self.id == 0 {
+            self.name == other.name
+        } else {
+            true
+        }
+    }
+}
+impl Eq for Symbol {}
+
+impl Debug for Symbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Symbol").field(&self.name).finish()
     }
 }
 
@@ -1195,7 +1492,8 @@ impl Dict {
     fn new(prototype: Option<Object>) -> Self {
         Self {
             soul: Soul::Object,
-            dict: HashMap::new(),
+            own: HashMap::new(),
+            sym: HashMap::new(),
             vec: Vec::new(),
             prototype,
         }
@@ -1208,43 +1506,81 @@ impl Dict {
             Soul::Integer(_) => memory.number_prototype.clone(),
             Soul::Float(_) => memory.number_prototype.clone(),
             Soul::String(_) => memory.string_prototype.clone(),
+            Soul::Symbol(_, _) => memory.symbol_prototype.clone(),
         };
         Self {
             soul,
-            dict: HashMap::new(),
+            own: HashMap::new(),
+            sym: HashMap::new(),
             vec: Vec::new(),
             prototype: Some(prototype),
         }
     }
-    fn property(&self, key: &String) -> Value {
-        if let Some(value) = self.own_property(key) {
-            value
-        } else if let Some(prototype) = &self.prototype {
-            prototype.property(key)
-        } else {
-            Value::Undefined
+    fn property(&self, key: impl Into<Key>) -> Option<Value> {
+        match key.into().cap_index(self.vec.len()) {
+            Key::Index(index) => {
+                if let Some(value) = self.vec[index].clone() {
+                    Some(value)
+                } else if let Some(prototype) = &self.prototype {
+                    prototype.property(Key::Index(index))
+                } else {
+                    None
+                }
+            }
+            Key::String(own) => {
+                if let Some(value) = self.own.get(&own) {
+                    Some(value.clone())
+                } else if let Some(prototype) = &self.prototype {
+                    prototype.property(Key::String(own))
+                } else {
+                    None
+                }
+            }
+            Key::Symbol(id, name) => {
+                let symbol = Symbol { id, name };
+                if let Some(value) = self.sym.get(&symbol) {
+                    Some(value.clone())
+                } else if let Some(prototype) = &self.prototype {
+                    prototype.property(Key::Symbol(symbol.id, symbol.name))
+                } else {
+                    None
+                }
+            }
         }
     }
-    fn own_property(&self, key: &String) -> Option<Value> {
-        if let Some(index) = key.try_into_index(self.vec.len()) {
-            self.vec[index].clone()
-        } else {
-            self.dict.get(key).cloned()
+    fn own_property(&self, key: impl Into<Key>) -> Option<Value> {
+        match key.into().cap_index(self.vec.len()) {
+            Key::Index(index) => self.vec[index].clone(),
+            Key::String(own) => self.own.get(&own).cloned(),
+            Key::Symbol(id, name) => self.sym.get(&Symbol { id, name }).cloned(),
         }
     }
-    fn assign_property(&mut self, key: String, value: Value) {
-        if let Some(index) = key.try_into_index(self.vec.len()) {
-            self.vec[index] = Some(value);
-        } else {
-            self.dict.insert(key, value);
+    fn assign_property(&mut self, key: impl Into<Key>, value: impl Into<Value>) {
+        match key.into().cap_index(self.vec.len()) {
+            Key::Index(index) => {
+                self.vec[index] = Some(value.into());
+            }
+            Key::String(own) => {
+                self.own.insert(own, value.into());
+            }
+            Key::Symbol(id, name) => {
+                self.sym.insert(Symbol { id, name }, value.into());
+            }
         }
     }
-    fn delete_property(&mut self, key: &String) {
-        if let Some(index) = key.try_into_index(self.vec.len()) {
-            self.vec[index] = None;
-        } else {
-            self.dict.remove(key);
+    fn delete_property(&mut self, key: impl Into<Key>) -> bool {
+        match key.into().cap_index(self.vec.len()) {
+            Key::Index(index) => {
+                self.vec[index] = None;
+            }
+            Key::String(own) => {
+                self.own.remove(&own);
+            }
+            Key::Symbol(id, name) => {
+                self.sym.remove(&Symbol { id, name });
+            }
         }
+        true
     }
     fn to_object(self) -> Object {
         Object(Rc::new(RefCell::new(self)))
@@ -1254,186 +1590,275 @@ impl Dict {
 impl Debug for Dict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // TODO: write a good debug function
-        self.dict.fmt(f)
+        let vec = self
+            .vec
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.as_ref().map(|value| (index, value)));
+        let own = self.own.iter();
+        let sym = self.sym.iter();
+        f.debug_map()
+            .entries(vec)
+            .entries(own)
+            .entries(sym)
+            .finish()
+    }
+}
+
+impl Key {
+    fn cap_index(self, max: usize) -> Self {
+        match self {
+            Self::Index(index) if index >= max => Self::String(String::from_integer(index as i64)),
+            Self::String(string) => match string.try_into_index(max) {
+                Some(index) => Self::Index(index),
+                None => Self::String(string),
+            },
+            ok => ok,
+        }
+    }
+}
+
+impl From<String> for Key {
+    fn from(value: String) -> Self {
+        Key::String(value)
+    }
+}
+
+impl From<Symbol> for Key {
+    fn from(value: Symbol) -> Self {
+        Key::Symbol(value.id, value.name)
+    }
+}
+
+impl From<(i64, &'static [u16])> for Key {
+    fn from((id, name): (i64, &'static [u16])) -> Self {
+        Key::Symbol(id, String::Static(name))
+    }
+}
+
+impl Function {
+    fn call(&self, state: &mut State, memory: &Memory, this: Value, argc: u32, ty: FrameType) {
+        match self {
+            Function::Native(native) => {
+                let value = native.call_as_function(state, memory, this, argc as usize);
+                state.stack.pop_many(argc);
+                state.stack.push(value);
+            }
+            Function::FunctionCall(call_site) => {
+                let this = this.to_object(memory).unwrap_or_else(|| memory.global());
+                let return_location = std::mem::replace(&mut state.prog, call_site.clone());
+                state
+                    .stack
+                    .push_frame(return_location, argc, Some(this), None, ty);
+            }
+        }
     }
 }
 
 /// executa um passo da máquina virtual,
 ///
-/// retorna Some(...) se for a instrução stop
+/// retorna Some(state.stack.pop()) se for a instrução stop
 #[inline]
-fn execute_step(prog: &mut ProgReader, stack: &mut Stack, memory: &Memory) -> Option<Value> {
+fn execute_step(state: &mut State, memory: &Memory) -> Option<Value> {
     use instruction::*;
-    match prog.read_instr() {
+    match state.prog.read_instr() {
         DEBUG => {
-            println!("DEBUG: {:#?}", stack.top());
+            println!("DEBUG: {:#?}", state.stack.top());
         }
         UNDEFINED => {
-            stack.push(Value::Undefined);
+            state.stack.push(Value::Undefined);
         }
         NULL => {
-            stack.push(Value::Null);
+            state.stack.push(Value::Null);
         }
         TRUE => {
-            stack.push(Value::Boolean(true));
+            state.stack.push(Value::Boolean(true));
         }
         FALSE => {
-            stack.push(Value::Boolean(false));
+            state.stack.push(Value::Boolean(false));
         }
         INTEGER_64 => {
-            stack.push(Value::Integer(prog.read_i64()));
+            state.stack.push(Value::Integer(state.prog.read_i64()));
         }
         INTEGER_32 => {
-            stack.push(Value::Integer(prog.read_i32() as i64));
+            state
+                .stack
+                .push(Value::Integer(state.prog.read_i32() as i64));
         }
         INTEGER_16 => {
-            stack.push(Value::Integer(prog.read_i16() as i64));
+            state
+                .stack
+                .push(Value::Integer(state.prog.read_i16() as i64));
         }
         INTEGER_8 => {
-            stack.push(Value::Integer(prog.read_i8() as i64));
+            state
+                .stack
+                .push(Value::Integer(state.prog.read_i8() as i64));
+        }
+        ZERO => {
+            state.stack.push(Value::Integer(0));
+        }
+        ONE => {
+            state.stack.push(Value::Integer(1));
         }
         FLOAT => {
-            stack.push(Value::Float(prog.read_f64()));
+            state.stack.push(Value::Float(state.prog.read_f64()));
         }
         STRING => {
-            stack.push(Value::String(prog.read_utf16()));
+            state.stack.push(Value::String(state.prog.read_utf16()));
         }
         BIGINT => todo!("BIGINT"),
         THIS => {
-            stack.push(Value::Object(stack.frame.this.clone()));
+            let this = state
+                .stack
+                .frame
+                .this
+                .clone()
+                .unwrap_or_else(|| memory.global.clone());
+            state.stack.push(Value::Object(this));
         }
         NEW_TARGET => {
-            if let Some(new_target) = &stack.frame.new_target {
-                stack.push(Value::Object(new_target.clone()));
+            if let Some(new_target) = &state.stack.frame.new_target {
+                state.stack.push(Value::Object(new_target.clone()));
             } else {
-                stack.push(Value::Undefined);
+                state.stack.push(Value::Undefined);
             }
         }
         FUNCTION => {
-            let jump = prog.read_i32();
+            let jump = state.prog.read_i32();
             let absolute = if jump >= 0 {
-                prog.pc + jump as usize
+                state.prog.pc + jump as usize
             } else {
-                prog.pc - (-jump) as usize
+                state.prog.pc - (-jump) as usize
             };
             let function = Function::FunctionCall(ProgReader {
-                program: prog.program.clone(),
+                program: state.prog.program.clone(),
                 pc: absolute,
             });
             let mut dict = Dict::from_soul(Soul::Function(function), memory);
             let prototype = Value::Object(Object::new(memory.global.clone()));
             dict.assign_property(PROTOTYPE_KEY.clone(), prototype);
-            stack.push(Value::Object(dict.to_object()))
+            state.stack.push(Value::Object(dict.to_object()))
         }
-        ARRAY => todo!("ARRAY"),
+        ARRAY => {
+            let argc = state.prog.read_u32() + state.stack.frame.spread;
+            state.stack.frame.spread = 0;
+            let items = state.stack.stack.drain(state.stack.len() - argc as usize..).map(|x| match x {
+                Slot::Value(value) => Some(value),
+                Slot::Unitialized => None,
+                _ => panic!("a instrução ARRAY removeu da pilha algo que não era Slot::Value nem Slot::Unitialized"),
+            });
+            let arr = Value::Object(memory.arr(items));
+            state.stack.push(arr);
+        }
         OBJECT => {
-            stack.push(Value::Object(Object::new(memory.object_prototype.clone())));
+            state
+                .stack
+                .push(Value::Object(Object::new(memory.object_prototype.clone())));
         }
         OBJECT_MEMBER => {
-            let member = prog.read_utf16();
-            let value = stack.pop();
-            if let Value::Object(object) = stack.top_mut() {
+            let member = Key::String(state.prog.read_utf16());
+            let value = state.stack.pop();
+            if let Value::Object(object) = state.stack.top_mut() {
                 object.assign_property(member, value);
             }
         }
         OBJECT_SPREAD => todo!("OBJECT_SPREAD"),
         MEMBER => {
-            let member = prog.read_utf16();
-            let object = stack.pop();
-            let value = object.property(&member, memory);
-            stack.push(value);
+            let member = Key::String(state.prog.read_utf16());
+            let object = state.stack.pop();
+            let value = object.property(member, memory).unwrap_or(Value::Undefined);
+            state.stack.push(value);
         }
         INDEX => {
-            let index = stack.pop();
-            let object = stack.pop();
-            let value = object.property(&index.to_string(), memory);
-            stack.push(value);
+            let index = state.stack.pop();
+            let object = state.stack.pop();
+            let value = object
+                .property(index.to_key(), memory)
+                .unwrap_or(Value::Undefined);
+            state.stack.push(value);
         }
 
         DUPE => {
-            let value = stack.top().clone();
-            stack.push(value);
+            let value = state.stack.top().clone();
+            state.stack.push(value);
         }
         DUPE_PAIR => {
-            let second = stack.pop();
-            let first = stack.pop();
-            stack.push(first.clone());
-            stack.push(second.clone());
-            stack.push(first);
-            stack.push(second);
+            let second = state.stack.pop();
+            let first = state.stack.pop();
+            state.stack.push(first.clone());
+            state.stack.push(second.clone());
+            state.stack.push(first);
+            state.stack.push(second);
         }
         PUSH => {
-            let address = prog.read_i32();
-            let value = stack.frame(address).clone();
-            stack.push(value);
+            let address = state.prog.read_i32();
+            let value = state.stack.frame(address).clone();
+            state.stack.push(value);
         }
         POP => {
-            stack.pop();
+            state.stack.pop();
         }
         POP_MANY => {
-            stack.pop_many(prog.read_u32());
+            state.stack.pop_many(state.prog.read_u32());
         }
         POP_RETAIN => {
-            let value = stack.pop();
-            stack.pop_many(prog.read_u32());
-            stack.push(value);
+            let value = state.stack.pop();
+            state.stack.pop_many(state.prog.read_u32());
+            state.stack.push(value);
         }
         GLOBAL_MEMBER => {
-            let s = prog.read_utf16();
+            let s = state.prog.read_utf16();
             let dict = memory.global.0.borrow();
-            if let Some(value) = dict.dict.get(&s) {
-                stack.push(value.clone());
+            if let Some(value) = dict.own.get(&s) {
+                state.stack.push(value.clone());
             } else {
                 todo!("error: Reference Error, global não encontrada")
             }
         }
         GLOBAL_OBJ => {
-            stack.push(Value::Object(memory.global.clone()));
+            state.stack.push(Value::Object(memory.global.clone()));
         }
         STATIC => {
-            let address = prog.read_u32();
-            let value = stack.absolute(address).clone();
-            stack.push(value);
+            let address = state.prog.read_u32();
+            let value = state.stack.absolute(address).clone();
+            state.stack.push(value);
         }
         UNITIALIZED => {
-            stack.stack.push(Slot::Unitialized);
+            state.stack.stack.push(Slot::Unitialized);
         }
         UNITIALIZED_MANY => {
-            let count = prog.read_u32() as usize;
-            stack.stack.reserve(count);
+            let count = state.prog.read_u32() as usize;
+            state.stack.stack.reserve(count);
             for _ in 0..count {
-                stack.stack.push(Slot::Unitialized);
+                state.stack.stack.push(Slot::Unitialized);
             }
         }
         CALL => {
-            let argc = prog.read_u32() + stack.frame.spread;
-            stack.frame.spread = 0;
-            let func = stack.pop();
-            let this = stack.pop();
+            let argc = state.prog.read_u32() + state.stack.frame.spread;
+            state.stack.frame.spread = 0;
+            let func = state.stack.pop();
+            let this = state.stack.pop();
             match func.to_function() {
-                Some(dispatch) => match dispatch {
-                    Function::FunctionCall(call_site) => {
-                        let this = this
-                            .to_object(memory)
-                            .unwrap_or_else(|| memory.global.clone());
-                        let new_target = None;
-                        let return_location = std::mem::replace(prog, call_site);
-                        stack.push_frame(return_location, argc, this, new_target);
-                    }
-                },
-                None => todo!("erro de execução, objecto não pode ser chamado"),
+                Some(func) => func.call(state, memory, this, argc, FrameType::Normal),
+                None => todo!("erro de execução, objeto não pode ser chamado"),
             }
         }
         CALL_NEW => {
-            let argc = prog.read_u32() + stack.frame.spread;
-            stack.frame.spread = 0;
-            let func = stack.pop();
+            let argc = state.prog.read_u32() + state.stack.frame.spread;
+            state.stack.frame.spread = 0;
+            let func = state.stack.pop();
             if let Value::Object(func_object) = func {
                 match func_object.to_function() {
                     Some(dispatch) => match dispatch {
+                        Function::Native(native) => {
+                            let object = native.call_as_constructor(state, memory, argc as usize);
+                            state.stack.pop_many(argc);
+                            state.stack.push(Value::Object(object));
+                        }
                         Function::FunctionCall(call_site) => {
-                            let prototype = if let Value::Object(prototype) =
-                                func_object.property(&PROTOTYPE_KEY)
+                            let prototype = if let Some(Value::Object(prototype)) =
+                                func_object.property(PROTOTYPE_KEY.clone())
                             {
                                 Some(prototype)
                             } else {
@@ -1441,8 +1866,14 @@ fn execute_step(prog: &mut ProgReader, stack: &mut Stack, memory: &Memory) -> Op
                             };
                             let this = Dict::new(prototype).to_object();
                             let new_target = Some(func_object);
-                            let return_location = std::mem::replace(prog, call_site);
-                            stack.push_frame(return_location, argc, this, new_target);
+                            let return_location = std::mem::replace(&mut state.prog, call_site);
+                            state.stack.push_frame(
+                                return_location,
+                                argc,
+                                Some(this),
+                                new_target,
+                                FrameType::Normal,
+                            );
                         }
                     },
                     None => todo!("erro de execução, objeto não pode ser chamado"),
@@ -1452,213 +1883,279 @@ fn execute_step(prog: &mut ProgReader, stack: &mut Stack, memory: &Memory) -> Op
             }
         }
         RETURN => {
-            let value = stack.pop();
-            *prog = stack.pop_frame(value);
+            let value = state.stack.pop();
+            state.prog = state.stack.pop_frame(value, memory);
         }
         RETURN_POP => {
-            let count = prog.read_u32();
-            let value = stack.pop();
-            stack.pop_many(count);
-            *prog = stack.pop_frame(value);
+            let count = state.prog.read_u32();
+            let value = state.stack.pop();
+            state.stack.pop_many(count);
+            state.prog = state.stack.pop_frame(value, memory);
         }
         QUIT => {
-            return Some(stack.pop());
+            return Some(state.stack.pop());
         }
 
-        SPREAD => todo!("SPREAD"),
+        ITERATOR => {
+            let this = state.stack.pop();
+            let into_iterator = this
+                .property(native::known_symbols::ITERATOR, memory)
+                .unwrap_or(Value::Undefined);
+            if let Some(func) = into_iterator.to_function() {
+                func.call(state, memory, this, 0, FrameType::Normal);
+            } else {
+                todo!("error: Objeto não é iterável")
+            }
+        }
+        ITERATE => {
+            let jump = state.prog.read_i32();
+            let this = state.stack.pop();
+            let next = this
+                .property(js_string!("next"), memory)
+                .unwrap_or(Value::Undefined);
+            let mut exit_loop = state.prog.clone();
+            exit_loop.jump(jump);
+            if let Some(func) = next.to_function() {
+                func.call(
+                    state,
+                    memory,
+                    this.clone(),
+                    0,
+                    FrameType::Iterate(Box::new((this, exit_loop))),
+                );
+            } else {
+                todo!("error: O objeto iterador não está de acordo com o protocolo de iterador");
+            }
+        }
+        SPREAD => {
+            let this = state.stack.pop();
+            let next = this
+                .property(js_string!("next"), memory)
+                .unwrap_or(Value::Undefined);
+            if let Some(func) = next.to_function() {
+                func.call(
+                    state,
+                    memory,
+                    this.clone(),
+                    0,
+                    FrameType::Spread(Box::new(this)),
+                );
+            } else {
+                todo!("error: O objeto iterador não está de acordo com o protocolo de iterador")
+            }
+        }
 
         ASSIGN => {
-            let address = prog.read_i32();
-            let value = stack.top().clone();
-            stack.frame_assign(address, value);
+            let address = state.prog.read_i32();
+            let value = state.stack.top().clone();
+            state.stack.frame_assign(address, value);
         }
         ASSIGN_GLOBAL => {
-            let member = prog.read_utf16();
-            let value = stack.top().clone();
+            let member = Key::String(state.prog.read_utf16());
+            let value = state.stack.top().clone();
             memory.global.assign_property(member, value);
         }
         ASSIGN_MEMBER => {
-            let member = prog.read_utf16();
-            let object = stack.pop();
-            let value = stack.top().clone();
+            let member = Key::String(state.prog.read_utf16());
+            let object = state.stack.pop();
+            let value = state.stack.top().clone();
             object.assign_property(member, value);
         }
         ASSIGN_INDEX => {
-            let index = stack.pop();
-            let object = stack.pop();
-            let value = stack.top().clone();
-            object.assign_property(index.to_string(), value);
+            let index = state.stack.pop();
+            let object = state.stack.pop();
+            let value = state.stack.top().clone();
+            object.assign_property(index.to_key(), value);
         }
         ASSIGN_STATIC => {
-            let address = prog.read_u32();
-            let value = stack.top().clone();
-            stack.absolute_assign(address, value);
+            let address = state.prog.read_u32();
+            let value = state.stack.top().clone();
+            state.stack.absolute_assign(address, value);
         }
-
         ASSIGN_STATIC_UNDEFINED => {
-            let address = prog.read_u32();
-            stack.absolute_assign(address, Value::Undefined);
+            let address = state.prog.read_u32();
+            state.stack.absolute_assign(address, Value::Undefined);
         }
 
         DELETE_GLOBAL => {
-            let member = prog.read_utf16();
-            memory.global.delete_property(&member);
-            stack.push(Value::Boolean(true));
+            let member = Key::String(state.prog.read_utf16());
+            let deleted = memory.global.delete_property(member);
+            state.stack.push(Value::Boolean(deleted));
         }
         DELETE_MEMBER => {
-            let member = prog.read_utf16();
-            stack.pop().delete_property(&member);
-            stack.push(Value::Boolean(true));
+            let member = Key::String(state.prog.read_utf16());
+            let deleted = state.stack.pop().delete_property(member);
+            state.stack.push(Value::Boolean(deleted));
         }
         DELETE_INDEX => {
-            let index = stack.pop();
-            stack.pop().delete_property(&index.to_string());
-            stack.push(Value::Boolean(true));
+            let index = state.stack.pop();
+            let deleted = state.stack.pop().delete_property(index.to_key());
+            state.stack.push(Value::Boolean(deleted));
         }
 
         JMP => {
-            let jump = prog.read_i32();
-            prog.jump(jump);
+            let jump = state.prog.read_i32();
+            state.prog.jump(jump);
         }
         JPT => {
-            let jump = prog.read_i32();
-            if stack.pop().to_boolean() {
-                prog.jump(jump);
+            let jump = state.prog.read_i32();
+            if state.stack.pop().to_boolean() {
+                state.prog.jump(jump);
             }
         }
         JPF => {
-            let jump = prog.read_i32();
-            if !stack.pop().to_boolean() {
-                prog.jump(jump);
+            let jump = state.prog.read_i32();
+            if !state.stack.pop().to_boolean() {
+                state.prog.jump(jump);
             }
         }
         JKT => {
-            let jump = prog.read_i32();
-            if stack.top().to_boolean() {
-                prog.jump(jump);
+            let jump = state.prog.read_i32();
+            if state.stack.top().to_boolean() {
+                state.prog.jump(jump);
             }
         }
         JKF => {
-            let jump = prog.read_i32();
-            if !stack.top().to_boolean() {
-                prog.jump(jump);
+            let jump = state.prog.read_i32();
+            if !state.stack.top().to_boolean() {
+                state.prog.jump(jump);
             }
         }
         JPN => {
-            let jump = prog.read_i32();
-            if !stack.pop().is_defined() {
-                prog.jump(jump);
+            let jump = state.prog.read_i32();
+            if !state.stack.pop().is_defined() {
+                state.prog.jump(jump);
             }
         }
         JPD => {
-            let jump = prog.read_i32();
-            if stack.pop().is_defined() {
-                prog.jump(jump);
+            let jump = state.prog.read_i32();
+            if state.stack.pop().is_defined() {
+                state.prog.jump(jump);
             }
         }
         JKN => {
-            let jump = prog.read_i32();
-            if !stack.top().is_defined() {
-                prog.jump(jump);
+            let jump = state.prog.read_i32();
+            if !state.stack.top().is_defined() {
+                state.prog.jump(jump);
             }
         }
         JKD => {
-            let jump = prog.read_i32();
-            if stack.top().is_defined() {
-                prog.jump(jump);
+            let jump = state.prog.read_i32();
+            if state.stack.top().is_defined() {
+                state.prog.jump(jump);
             }
         }
         JPNU => {
-            let jump = prog.read_i32();
-            if !matches!(stack.top(), Value::Undefined) {
-                prog.jump(jump);
+            let jump = state.prog.read_i32();
+            if !matches!(state.stack.top(), Value::Undefined) {
+                state.prog.jump(jump);
             }
         }
         INCREMENT => {
-            stack.execute_prefix(Value::increment);
+            state.stack.execute_prefix(Value::increment);
         }
         DECREMENT => {
-            stack.execute_prefix(Value::decrement);
+            state.stack.execute_prefix(Value::decrement);
         }
         PRE_INCREMENT => {
-            let address = prog.read_i32();
-            let value = std::mem::take(stack.frame_mut(address)).increment();
-            stack.frame_assign(address, value.clone());
-            stack.push(value);
+            let address = state.prog.read_i32();
+            let value = std::mem::take(state.stack.frame_mut(address)).increment();
+            state.stack.frame_assign(address, value.clone());
+            state.stack.push(value);
         }
         PRE_DECREMENT => {
-            let address = prog.read_i32();
-            let value = std::mem::take(stack.frame_mut(address)).decrement();
-            stack.frame_assign(address, value.clone());
-            stack.push(value);
+            let address = state.prog.read_i32();
+            let value = std::mem::take(state.stack.frame_mut(address)).decrement();
+            state.stack.frame_assign(address, value.clone());
+            state.stack.push(value);
         }
         POST_INCREMENT => {
-            let address = prog.read_i32();
-            let value = std::mem::take(stack.frame_mut(address));
-            stack.frame_assign(address, value.clone().increment());
-            stack.push(value);
+            let address = state.prog.read_i32();
+            let value = std::mem::take(state.stack.frame_mut(address));
+            state.stack.frame_assign(address, value.clone().increment());
+            state.stack.push(value);
         }
         POST_DECREMENT => {
-            let address = prog.read_i32();
-            let value = std::mem::take(stack.frame_mut(address));
-            stack.frame_assign(address, value.clone().decrement());
-            stack.push(value);
+            let address = state.prog.read_i32();
+            let value = std::mem::take(state.stack.frame_mut(address));
+            state.stack.frame_assign(address, value.clone().decrement());
+            state.stack.push(value);
         }
         PRE_INCREMENT_STATIC => {
-            let address = prog.read_u32();
-            let value = std::mem::take(stack.absolute_mut(address)).increment();
-            stack.absolute_assign(address, value.clone());
+            let address = state.prog.read_u32();
+            let value = std::mem::take(state.stack.absolute_mut(address)).increment();
+            state.stack.absolute_assign(address, value.clone());
+            state.stack.push(value);
         }
         PRE_DECREMENT_STATIC => {
-            let address = prog.read_u32();
-            let value = std::mem::take(stack.absolute_mut(address)).decrement();
-            stack.absolute_assign(address, value.clone());
+            let address = state.prog.read_u32();
+            let value = std::mem::take(state.stack.absolute_mut(address)).decrement();
+            state.stack.absolute_assign(address, value.clone());
+            state.stack.push(value);
         }
         POST_INCREMENT_STATIC => {
-            let address = prog.read_u32();
-            let value = std::mem::take(stack.absolute_mut(address));
-            stack.absolute_assign(address, value.clone().increment());
+            let address = state.prog.read_u32();
+            let value = std::mem::take(state.stack.absolute_mut(address));
+            state
+                .stack
+                .absolute_assign(address, value.clone().increment());
+            state.stack.push(value);
         }
         POST_DECREMENT_STATIC => {
-            let address = prog.read_u32();
-            let value = std::mem::take(stack.absolute_mut(address));
-            stack.absolute_assign(address, value.clone().decrement());
+            let address = state.prog.read_u32();
+            let value = std::mem::take(state.stack.absolute_mut(address));
+            state
+                .stack
+                .absolute_assign(address, value.clone().decrement());
+            state.stack.push(value);
         }
 
-        POWER => stack.execute_infix(Value::power),
-        MULTIPLY => stack.execute_infix(std::ops::Mul::mul),
-        DIVIDE => stack.execute_infix(std::ops::Div::div),
-        REMAINDER => stack.execute_infix(std::ops::Rem::rem),
-        ADD => stack.execute_infix(std::ops::Add::add),
-        SUBTRACT => stack.execute_infix(std::ops::Sub::sub),
-        BITWISE_LEFT => stack.execute_infix(std::ops::Shl::shl),
-        BITWISE_RIGHT => stack.execute_infix(std::ops::Shr::shr),
-        BITWISE_RIGHT_UNSIGNED => stack.execute_infix(Value::bitwise_right_unsigned),
-        LESS => stack.execute_infix(|l, r| Value::Boolean(l < r)),
-        LESS_EQUAL => stack.execute_infix(|l, r| Value::Boolean(l <= r)),
-        GREATER => stack.execute_infix(|l, r| Value::Boolean(l > r)),
-        GREATER_EQUAL => stack.execute_infix(|l, r| Value::Boolean(l >= r)),
-        IN => todo!("operador in"),
-        INSTANCEOF => stack.execute_infix(|l, r| Value::Boolean(l.instanceof(r))),
-        EQUAL => stack.execute_infix(|l, r| Value::Boolean(l.sloppy_equals(r))),
-        NOT_EQUAL => stack.execute_infix(|l, r| Value::Boolean(!l.sloppy_equals(r))),
-        IDENTICAL => stack.execute_infix(|l, r| Value::Boolean(l == r)),
-        NOT_IDENTICAL => stack.execute_infix(|l, r| Value::Boolean(l != r)),
-        BITWISE_AND => stack.execute_infix(std::ops::BitAnd::bitand),
-        BITWISE_XOR => stack.execute_infix(std::ops::BitXor::bitxor),
-        BITWISE_OR => stack.execute_infix(std::ops::BitOr::bitor),
+        POWER => state.stack.execute_infix(Value::power),
+        MULTIPLY => state.stack.execute_infix(std::ops::Mul::mul),
+        DIVIDE => state.stack.execute_infix(std::ops::Div::div),
+        REMAINDER => state.stack.execute_infix(std::ops::Rem::rem),
+        ADD => state.stack.execute_infix(std::ops::Add::add),
+        SUBTRACT => state.stack.execute_infix(std::ops::Sub::sub),
+        BITWISE_LEFT => state.stack.execute_infix(std::ops::Shl::shl),
+        BITWISE_RIGHT => state.stack.execute_infix(std::ops::Shr::shr),
+        BITWISE_RIGHT_UNSIGNED => state.stack.execute_infix(Value::bitwise_right_unsigned),
+        LESS => state.stack.execute_infix(|l, r| Value::Boolean(l < r)),
+        LESS_EQUAL => state.stack.execute_infix(|l, r| Value::Boolean(l <= r)),
+        GREATER => state.stack.execute_infix(|l, r| Value::Boolean(l > r)),
+        GREATER_EQUAL => state.stack.execute_infix(|l, r| Value::Boolean(l >= r)),
+        IN => state.stack.execute_infix(|l, r| {
+            if let Value::Object(object) = r {
+                Value::Boolean(object.property(l.to_key()).is_some())
+            } else {
+                todo!("erro: não é possivel o operador in para buscar um valor em r")
+            }
+        }),
+        INSTANCEOF => state
+            .stack
+            .execute_infix(|l, r| Value::Boolean(l.instanceof(r))),
+        EQUAL => state
+            .stack
+            .execute_infix(|l, r| Value::Boolean(l.sloppy_equals(r))),
+        NOT_EQUAL => state
+            .stack
+            .execute_infix(|l, r| Value::Boolean(!l.sloppy_equals(r))),
+        IDENTICAL => state.stack.execute_infix(|l, r| Value::Boolean(l == r)),
+        NOT_IDENTICAL => state.stack.execute_infix(|l, r| Value::Boolean(l != r)),
+        BITWISE_AND => state.stack.execute_infix(std::ops::BitAnd::bitand),
+        BITWISE_XOR => state.stack.execute_infix(std::ops::BitXor::bitxor),
+        BITWISE_OR => state.stack.execute_infix(std::ops::BitOr::bitor),
         COMMA => {
-            let value = stack.pop();
-            stack.pop();
-            stack.push(value);
+            let value = state.stack.pop();
+            state.stack.pop();
+            state.stack.push(value);
         }
 
-        TYPEOF => stack.execute_prefix(Value::type_name),
-        VOID => *stack.top_mut() = Value::Undefined,
-        BITWISE_NOT => stack.execute_prefix(Value::bitwise_not),
-        NOT => stack.execute_prefix(|x| Value::Boolean(!x)),
-        UNARY_PLUS => stack.execute_prefix(|x| x.to_number().to_value()),
-        UNARY_MINUS => stack.execute_prefix(std::ops::Neg::neg),
+        TYPEOF => state.stack.execute_prefix(Value::type_name),
+        VOID => *state.stack.top_mut() = Value::Undefined,
+        BITWISE_NOT => state.stack.execute_prefix(Value::bitwise_not),
+        NOT => state.stack.execute_prefix(|x| Value::Boolean(!x)),
+        UNARY_PLUS => state.stack.execute_prefix(|x| x.to_number().to_value()),
+        UNARY_MINUS => state.stack.execute_prefix(std::ops::Neg::neg),
 
         AWAIT => todo!("AWAIT"),
 

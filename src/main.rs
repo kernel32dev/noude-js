@@ -2,7 +2,6 @@
 use std::{process::ExitCode, rc::Rc, time::Instant};
 
 mod compiler;
-mod operator;
 mod runtime;
 mod syntax;
 mod token;

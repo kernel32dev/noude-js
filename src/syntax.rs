@@ -809,9 +809,7 @@ impl<'a> Assignee<'a> {
 impl<'a> SimpleAssignee<'a> {
     fn src(&self) -> &'a src {
         match self {
-            Self::Identifier(src)
-            | Self::Member(src, _, _)
-            | Self::Index(src, _, _) => src,
+            Self::Identifier(src) | Self::Member(src, _, _) | Self::Index(src, _, _) => src,
         }
     }
 }
@@ -1080,7 +1078,9 @@ impl<'a> Expr<'a> {
                         if let Ok(token) = iter.join(token, "-") {
                             ExprPostfix::PostDecrement(token)
                         } else if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Subtract(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Subtract(
+                                token,
+                            ));
                         } else {
                             break ExprInfix::Subtract(token);
                         }
@@ -1089,12 +1089,16 @@ impl<'a> Expr<'a> {
                         let token = iter.take_text();
                         if let Ok(token) = iter.join(token, "*") {
                             if let Ok(token) = iter.join(token, "*") {
-                                break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Power(token));
+                                break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Power(
+                                    token,
+                                ));
                             } else {
                                 break ExprInfix::Power(token);
                             }
                         } else if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Multiply(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Multiply(
+                                token,
+                            ));
                         } else {
                             break ExprInfix::Multiply(token);
                         }
@@ -1102,7 +1106,9 @@ impl<'a> Expr<'a> {
                     "/" => {
                         let token = iter.take_text();
                         if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Divide(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Divide(
+                                token,
+                            ));
                         } else {
                             break ExprInfix::Divide(token);
                         }
@@ -1110,7 +1116,9 @@ impl<'a> Expr<'a> {
                     "%" => {
                         let token = iter.take_text();
                         if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Remainder(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Remainder(
+                                token,
+                            ));
                         } else {
                             break ExprInfix::Remainder(token);
                         }
@@ -1145,14 +1153,16 @@ impl<'a> Expr<'a> {
                         if let Ok(token) = iter.join(token, ">") {
                             if let Ok(token) = iter.join(token, ">") {
                                 if let Ok(token) = iter.join(token, "=") {
-                                    break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseRightUnsigned(
-                                        token,
-                                    ));
+                                    break ExprInfix::CompoundAssign(
+                                        ExprInfixCompoundAssign::BitwiseRightUnsigned(token),
+                                    );
                                 } else {
                                     break ExprInfix::BitwiseRightUnsigned(token);
                                 }
                             } else if let Ok(token) = iter.join(token, "=") {
-                                break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseRight(token));
+                                break ExprInfix::CompoundAssign(
+                                    ExprInfixCompoundAssign::BitwiseRight(token),
+                                );
                             } else {
                                 break ExprInfix::BitwiseRight(token);
                             }
@@ -1166,7 +1176,9 @@ impl<'a> Expr<'a> {
                         let token = iter.take_text();
                         if let Ok(token) = iter.join(token, "<") {
                             if let Ok(token) = iter.join(token, "=") {
-                                break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseLeft(token));
+                                break ExprInfix::CompoundAssign(
+                                    ExprInfixCompoundAssign::BitwiseLeft(token),
+                                );
                             } else {
                                 break ExprInfix::BitwiseLeft(token);
                             }
@@ -1181,7 +1193,9 @@ impl<'a> Expr<'a> {
                         if let Ok(token) = iter.join(token, "&") {
                             break ExprInfix::And(token);
                         } else if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseAnd(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseAnd(
+                                token,
+                            ));
                         } else {
                             break ExprInfix::BitwiseAnd(token);
                         }
@@ -1191,7 +1205,9 @@ impl<'a> Expr<'a> {
                         if let Ok(token) = iter.join(token, "|") {
                             break ExprInfix::Or(token);
                         } else if let Ok(token) = iter.join(token, "=") {
-                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseOr(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseOr(
+                                token,
+                            ));
                         } else {
                             break ExprInfix::BitwiseOr(token);
                         }
@@ -1199,7 +1215,9 @@ impl<'a> Expr<'a> {
                     "^" => {
                         let token = iter.take_text();
                         if let Ok(token) = iter.join(token, "^") {
-                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseXor(token));
+                            break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::BitwiseXor(
+                                token,
+                            ));
                         } else {
                             break ExprInfix::BitwiseXor(token);
                         }
@@ -1209,7 +1227,9 @@ impl<'a> Expr<'a> {
                         match iter.join(token, "?") {
                             Ok(token) => match iter.join(token, "=") {
                                 Ok(token) => {
-                                    break ExprInfix::CompoundAssign(ExprInfixCompoundAssign::Coalesce(token))
+                                    break ExprInfix::CompoundAssign(
+                                        ExprInfixCompoundAssign::Coalesce(token),
+                                    )
                                 }
                                 Err(token) => break ExprInfix::Coalesce(token),
                             },
@@ -1332,8 +1352,8 @@ impl<'a> Expr<'a> {
             match token.ty {
                 TokenType::Number | TokenType::String | TokenType::Identifier => true,
                 TokenType::Keyword => match token.text {
-                    "undefined" | "null" | "true" | "false" | "this" | "parameters" | "new"
-                    | "async" | "delete" | "typeof" | "void" | "~" | "!" | "await" => true,
+                    "null" | "true" | "false" | "this" | "parameters" | "new" | "async"
+                    | "delete" | "typeof" | "void" | "~" | "!" | "await" => true,
                     _ => false,
                 },
                 TokenType::Punct => match token.text {
@@ -1354,7 +1374,9 @@ impl<'a> Expr<'a> {
             if let ExprPart::Value(value) = parts[0].take() {
                 return value;
             } else {
-                panic!("Expr::from_parts chamado com um array de tamanho 1 que continha um operador");
+                panic!(
+                    "Expr::from_parts chamado com um array de tamanho 1 que continha um operador"
+                );
             }
         }
         let mut precedence = u8::MAX;
